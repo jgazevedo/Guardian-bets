@@ -316,12 +316,13 @@ async function registerCommands() {
     
     console.log('🔄 Started refreshing application (/) commands.');
     
+    // Your specific guild ID
     await rest.put(
-      Routes.applicationCommands(process.env.DISCORD_CLIENT_ID),
+      Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, '979180991836995674'),
       { body: commands }
     );
     
-    console.log('✅ Successfully reloaded application (/) commands.');
+    console.log('✅ Successfully reloaded guild-specific commands (instant update).');
   } catch (error) {
     console.error('❌ Error registering commands:', error);
   }
