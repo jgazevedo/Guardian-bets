@@ -922,4 +922,10 @@ process.on('SIGINT', async () => {
   await pool.end();
   client.destroy();
   process.exit(0);
+
+console.log('Token length:', process.env.DISCORD_BOT_TOKEN?.length);
+console.log('Token starts with:', process.env.DISCORD_BOT_TOKEN?.substring(0, 10));
+
 });
+
+
