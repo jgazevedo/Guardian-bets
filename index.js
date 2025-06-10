@@ -251,7 +251,7 @@ async function registerCommands() {
     console.log('✅ Cleared global commands.');
     await rest.put(
       Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, '979180991836995674'),
-      { body: commands }
+      { body: components }
     );
     console.log('✅ Successfully reloaded guild-specific commands (instant update).');
   } catch (error) {
@@ -437,14 +437,15 @@ client.on('interactionCreate', async interaction => {
       const { customId, fields, components } = interaction;
       console.log(`Modal submit: ${customId}, Fields: ${JSON.stringify(fields.fields)}, Components: ${JSON.stringify(components)}`);
       if (customId === 'add_credits_modal' || customId === 'remove_credits_modal') {
-        const userSelect = components[0]?.components[0];
+        const userSelectComponent = components.find(row => row.components.some(comp => comp.customId === 'user_select'));
+        const userSelect = userSelectComponent?.components.find(comp => comp.customId === 'user_select');
         const selectedUserId = userSelect?.data?.values ? userSelect.data.values[0] : null;
+        console.log(`User select component: ${JSON.stringify(userSelectComponent)}, Selected user ID: ${selectedUserId}`);
         if (!selectedUserId) {
           console.log('No user selected in modal, Components:', JSON.stringify(components));
-          await interaction.reply({ content: '❌ No user selected!', flags: MessageFlags.Ephemeral });
+          await interaction.reply({ content: '❌ No user selected! Please select a user and try again.', flags: MessageFlags.Ephemeral });
           return;
         }
-        console.log(`Selected user ID: ${selectedUserId}`);
         const credits = parseInt(fields.getTextInputValue('credits'));
         if (isNaN(credits) || credits < 1 || credits > 999999) {
           console.log(`Invalid credits: ${fields.getTextInputValue('credits')}`);
@@ -481,7 +482,7 @@ client.on('interactionCreate', async interaction => {
           const optionText = fields.getTextInputValue(`option_${i}`);
           if (optionText) {
             const emojiMatch = optionText.match(/[\uD800-\uDBFF][\uDC00-\uDFFF]/);
-            options.push({ text: optionText.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/, '').trim() || `Option ${i}`, emoji: emojiMatch ? emojiMatch[0] : '' });
+            options.push({ text: optionText.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/, '').trim() || `Option ${i}`, emoji: emojiMatch ? emojiMatch[0] : null });
           }
         }
         console.log('Creating pool with:', { description, options });
@@ -497,12 +498,14 @@ client.on('interactionCreate', async interaction => {
         const channel = interaction.channel;
         const poolMessage = await channel.send({
           content: `**New Pool: ${description}**\n(Created by <@${interaction.user.id}>, closes in 3 minutes)`,
-          components: [new ActionRowBuilder().addComponents(options.map((opt, i) => new ButtonBuilder()
-            .setCustomId(`bet_${poolId}_${i}`)
-            .setLabel(opt.text)
-            .setStyle(ButtonStyle.Primary)
-            .setEmoji(opt.emoji)
-          ))]
+          components: [new ActionRowBuilder().addComponents(options.map((opt, i) => {
+            const button = new ButtonBuilder()
+              .setCustomId(`bet_${poolId}_${i}`)
+              .setLabel(opt.text)
+              .setStyle(ButtonStyle.Primary);
+            if (opt.emoji) button.setEmoji(opt.emoji); // Only set emoji if it exists
+            return button;
+          }))]
         });
         await pool.query('UPDATE betting_pools SET message_id = $1, channel_id = $2 WHERE id = $3', [poolMessage.id, channel.id, poolId]);
         activePools.set(poolId, { messageId: poolMessage.id, channelId: channel.id });
