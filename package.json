@@ -1,0 +1,21 @@
+{
+  "name": "discord-betting-bot",
+  "version": "1.0.0",
+  "description": "A Discord bot for managing betting pools with persistent PostgreSQL storage, including daily bonuses, user points, and pool creation/closure features.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "pg": "^8.11.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["discord", "bot", "betting", "postgresql", "railway", "pools"],
+  "author": "Your Name",
+  "license": "MIT"
+}
