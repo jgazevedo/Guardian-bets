@@ -1,0 +1,20 @@
+{
+  "name": "discord-betting-bot",
+  "version": "1.0.0",
+  "description": "Discord betting bot with persistent PostgreSQL storage",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "pg": "^8.11.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["discord", "bot", "postgresql", "railway"],
+  "author": "Your Name",
+  "license": "MIT"
+}
