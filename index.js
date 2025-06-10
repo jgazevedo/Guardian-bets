@@ -31,7 +31,8 @@ async function initDatabase() {
       CREATE TABLE IF NOT EXISTS user_points (
         user_id VARCHAR(20) PRIMARY KEY,
         points INTEGER DEFAULT 100,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_daily TIMESTAMP
       )
     `)
 
@@ -70,6 +71,21 @@ async function initDatabase() {
       )
     `)
 
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS loans (
+        id SERIAL PRIMARY KEY,
+        lender_id VARCHAR(20),
+        borrower_id VARCHAR(20),
+        amount INTEGER,
+        interest_rate DECIMAL(5,2),
+        days INTEGER,
+        status VARCHAR(20) DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        due_date TIMESTAMP,
+        accepted_at TIMESTAMP
+      )
+    `)
+
     // Add unique constraint if it doesn't exist
     try {
       await pool.query(`
@@ -83,6 +99,18 @@ async function initDatabase() {
         console.log("✅ Unique constraint already exists")
       } else {
         console.error("Error adding unique constraint:", error)
+      }
+    }
+
+    // Add last_daily column if it doesn't exist
+    try {
+      await pool.query(`ALTER TABLE user_points ADD COLUMN last_daily TIMESTAMP`)
+      console.log("✅ Added last_daily column to user_points table")
+    } catch (error) {
+      if (error.code === "42701") {
+        console.log("✅ last_daily column already exists")
+      } else {
+        console.error("Error adding last_daily column:", error)
       }
     }
 
@@ -101,6 +129,35 @@ async function getUserPoints(userId) {
   } catch (error) {
     console.error("Error getting user points:", error)
     return null
+  }
+}
+
+async function canClaimDaily(userId) {
+  try {
+    const result = await pool.query("SELECT last_daily FROM user_points WHERE user_id = $1", [userId])
+    if (result.rows.length === 0) return false
+
+    const lastDaily = result.rows[0].last_daily
+    if (!lastDaily) return true
+
+    const now = new Date()
+    const lastClaim = new Date(lastDaily)
+    const hoursSinceLastClaim = (now - lastClaim) / (1000 * 60 * 60)
+
+    return hoursSinceLastClaim >= 24
+  } catch (error) {
+    console.error("Error checking daily claim:", error)
+    return false
+  }
+}
+
+async function claimDaily(userId) {
+  try {
+    await pool.query("UPDATE user_points SET last_daily = CURRENT_TIMESTAMP WHERE user_id = $1", [userId])
+    return true
+  } catch (error) {
+    console.error("Error claiming daily:", error)
+    return false
   }
 }
 
@@ -129,6 +186,126 @@ async function updateUserPoints(userId, points) {
   } catch (error) {
     console.error("Error updating user points:", error)
     return false
+  }
+}
+
+async function createLoan(lenderId, borrowerId, amount, interestRate, days) {
+  try {
+    const dueDate = new Date()
+    dueDate.setDate(dueDate.getDate() + days)
+
+    const result = await pool.query(
+      `INSERT INTO loans (lender_id, borrower_id, amount, interest_rate, days, due_date) 
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+      [lenderId, borrowerId, amount, interestRate, days, dueDate],
+    )
+    return result.rows[0].id
+  } catch (error) {
+    console.error("Error creating loan:", error)
+    return null
+  }
+}
+
+async function acceptLoan(loanId) {
+  try {
+    const result = await pool.query(
+      `UPDATE loans SET status = 'active', accepted_at = CURRENT_TIMESTAMP 
+       WHERE id = $1 AND status = 'pending' RETURNING *`,
+      [loanId],
+    )
+
+    if (result.rows.length > 0) {
+      const loan = result.rows[0]
+
+      // Transfer points from lender to borrower
+      const lenderPoints = await getUserPoints(loan.lender_id)
+      const borrowerPoints = await getUserPoints(loan.borrower_id)
+
+      await updateUserPoints(loan.lender_id, lenderPoints - loan.amount)
+      await updateUserPoints(loan.borrower_id, borrowerPoints + loan.amount)
+
+      // Set up auto-collection timer
+      const timeUntilDue = new Date(loan.due_date) - new Date()
+      setTimeout(() => {
+        collectLoan(loanId)
+      }, timeUntilDue)
+
+      return loan
+    }
+    return null
+  } catch (error) {
+    console.error("Error accepting loan:", error)
+    return null
+  }
+}
+
+async function collectLoan(loanId) {
+  try {
+    const result = await pool.query("SELECT * FROM loans WHERE id = $1 AND status = 'active'", [loanId])
+
+    if (result.rows.length > 0) {
+      const loan = result.rows[0]
+      const totalOwed = Math.floor(loan.amount * (1 + loan.interest_rate / 100))
+
+      const borrowerPoints = await getUserPoints(loan.borrower_id)
+      await updateUserPoints(loan.borrower_id, borrowerPoints - totalOwed)
+
+      await pool.query("UPDATE loans SET status = 'collected' WHERE id = $1", [loanId])
+
+      console.log(`Auto-collected loan ${loanId}: ${totalOwed} points from user ${loan.borrower_id}`)
+    }
+  } catch (error) {
+    console.error("Error collecting loan:", error)
+  }
+}
+
+async function payLoan(borrowerId, loanId, amount) {
+  try {
+    const result = await pool.query("SELECT * FROM loans WHERE id = $1 AND borrower_id = $2 AND status = 'active'", [
+      loanId,
+      borrowerId,
+    ])
+
+    if (result.rows.length === 0) return null
+
+    const loan = result.rows[0]
+    const totalOwed = Math.floor(loan.amount * (1 + loan.interest_rate / 100))
+
+    if (amount >= totalOwed) {
+      // Full payment
+      const borrowerPoints = await getUserPoints(borrowerId)
+      await updateUserPoints(borrowerId, borrowerPoints - totalOwed)
+
+      await pool.query("UPDATE loans SET status = 'paid' WHERE id = $1", [loanId])
+
+      return { type: "full", amount: totalOwed, remaining: 0 }
+    } else {
+      // Partial payment (not implemented in this version)
+      return { type: "insufficient", needed: totalOwed - amount }
+    }
+  } catch (error) {
+    console.error("Error paying loan:", error)
+    return null
+  }
+}
+
+async function getUserLoans(userId) {
+  try {
+    const result = await pool.query(
+      `SELECT l.*, 
+       CASE 
+         WHEN l.borrower_id = $1 THEN 'borrower'
+         WHEN l.lender_id = $1 THEN 'lender'
+       END as role
+       FROM loans l 
+       WHERE (l.borrower_id = $1 OR l.lender_id = $1) AND l.status IN ('pending', 'active')
+       ORDER BY l.created_at DESC`,
+      [userId],
+    )
+    return result.rows
+  } catch (error) {
+    console.error("Error getting user loans:", error)
+    return []
   }
 }
 
@@ -364,10 +541,45 @@ const client = new Client({
 
 // Slash commands
 const commands = [
-  new SlashCommandBuilder().setName("daily").setDescription("Claim your daily points bonus"),
+  new SlashCommandBuilder().setName("daily").setDescription("Claim your daily points bonus (once per 24 hours)"),
   new SlashCommandBuilder().setName("participate").setDescription("Join the bot and receive 1000 starting points"),
   new SlashCommandBuilder().setName("wallet").setDescription("Check your current points balance"),
   new SlashCommandBuilder().setName("mybets").setDescription("View your current active bets"),
+  new SlashCommandBuilder().setName("myloans").setDescription("View your active loans (borrowed and lent)"),
+  new SlashCommandBuilder()
+    .setName("lend")
+    .setDescription("Lend points to another user")
+    .addUserOption((option) => option.setName("user").setDescription("The user to lend points to").setRequired(true))
+    .addIntegerOption((option) =>
+      option
+        .setName("amount")
+        .setDescription("Amount of points to lend")
+        .setRequired(true)
+        .setMinValue(10)
+        .setMaxValue(999999),
+    )
+    .addNumberOption((option) =>
+      option
+        .setName("interest")
+        .setDescription("Interest rate percentage (e.g., 5 for 5%)")
+        .setRequired(true)
+        .setMinValue(0)
+        .setMaxValue(100),
+    )
+    .addIntegerOption((option) =>
+      option
+        .setName("days")
+        .setDescription("Number of days for repayment")
+        .setRequired(true)
+        .setMinValue(1)
+        .setMaxValue(365),
+    ),
+  new SlashCommandBuilder()
+    .setName("pay")
+    .setDescription("Pay back a loan early")
+    .addIntegerOption((option) =>
+      option.setName("loan_id").setDescription("The ID of the loan to pay back").setRequired(true).setMinValue(1),
+    ),
   new SlashCommandBuilder()
     .setName("add")
     .setDescription("Add points to a user (Admin only)")
@@ -377,7 +589,7 @@ const commands = [
         .setName("amount")
         .setDescription("Amount of points to add")
         .setRequired(true)
-        .setMinValue(1)
+        .setMinvalue(1)
         .setMaxValue(999999),
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
@@ -392,7 +604,7 @@ const commands = [
         .setName("amount")
         .setDescription("Amount of points to remove")
         .setRequired(true)
-        .setMinValue(1)
+        .setMinvalue(1)
         .setMaxValue(999999),
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
@@ -442,9 +654,21 @@ client.on("interactionCreate", async (interaction) => {
             })
             break
           }
+
+          const canClaim = await canClaimDaily(user.id)
+          if (!canClaim) {
+            await interaction.reply({
+              content: "❌ You have already claimed your daily bonus! You can claim again in 24 hours.",
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
+
           const dailyBonus = 100
           const newPoints = currentPoints + dailyBonus
           await updateUserPoints(user.id, newPoints)
+          await claimDaily(user.id)
+
           await interaction.reply({
             content: `🎁 **Daily bonus claimed!** You received **${dailyBonus}** points!\n💰 New balance: **${formatNumber(newPoints)}** points`,
             flags: MessageFlags.Ephemeral,
@@ -526,6 +750,158 @@ client.on("interactionCreate", async (interaction) => {
           }
 
           await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral })
+          break
+        }
+
+        case "myloans": {
+          const userPoints = await getUserPoints(user.id)
+          if (userPoints === null) {
+            await interaction.reply({
+              content: "❌ You must use `/participate` first to join the bot!",
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
+
+          const loans = await getUserLoans(user.id)
+          if (loans.length === 0) {
+            await interaction.reply({
+              content: "💳 You have no active loans right now.",
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
+
+          const embed = new EmbedBuilder()
+            .setTitle("💳 Your Active Loans")
+            .setColor(0x3498db)
+            .setFooter({ text: `Balance: ${formatNumber(userPoints)} points` })
+
+          for (const loan of loans) {
+            const totalOwed = Math.floor(loan.amount * (1 + loan.interest_rate / 100))
+            const dueDate = new Date(loan.due_date).toLocaleDateString()
+
+            if (loan.role === "borrower") {
+              embed.addFields({
+                name: `💸 Borrowed (ID: ${loan.id})`,
+                value: `**Amount:** ${formatNumber(loan.amount)} points\n**Interest:** ${loan.interest_rate}%\n**Total to pay:** ${formatNumber(totalOwed)} points\n**Due:** ${dueDate}\n**Status:** ${loan.status}`,
+                inline: false,
+              })
+            } else {
+              embed.addFields({
+                name: `💰 Lent (ID: ${loan.id})`,
+                value: `**Amount:** ${formatNumber(loan.amount)} points\n**Interest:** ${loan.interest_rate}%\n**Will receive:** ${formatNumber(totalOwed)} points\n**Due:** ${dueDate}\n**Status:** ${loan.status}`,
+                inline: false,
+              })
+            }
+          }
+
+          await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral })
+          break
+        }
+
+        case "lend": {
+          const lender = user
+          const borrower = interaction.options.getUser("user")
+          const amount = interaction.options.getInteger("amount")
+          const interest = interaction.options.getNumber("interest")
+          const days = interaction.options.getInteger("days")
+
+          if (borrower.id === lender.id) {
+            await interaction.reply({
+              content: "❌ You cannot lend points to yourself!",
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
+
+          const lenderPoints = await getUserPoints(lender.id)
+          if (lenderPoints === null) {
+            await interaction.reply({
+              content: "❌ You must use `/participate` first to join the bot!",
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
+
+          const borrowerPoints = await getUserPoints(borrower.id)
+          if (borrowerPoints === null) {
+            await interaction.reply({
+              content: `❌ ${borrower.username} has not joined the bot yet! They must use /participate first.`,
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
+
+          if (lenderPoints < amount) {
+            await interaction.reply({
+              content: `❌ Insufficient points! You only have **${formatNumber(lenderPoints)}** points.`,
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
+
+          const loanId = await createLoan(lender.id, borrower.id, amount, interest, days)
+          if (!loanId) {
+            await interaction.reply({
+              content: "❌ Failed to create loan. Please try again.",
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
+
+          const totalOwed = Math.floor(amount * (1 + interest / 100))
+          const acceptButton = new ButtonBuilder()
+            .setCustomId(`accept_loan_${loanId}`)
+            .setLabel("Accept Loan")
+            .setStyle(ButtonStyle.Success)
+
+          const rejectButton = new ButtonBuilder()
+            .setCustomId(`reject_loan_${loanId}`)
+            .setLabel("Reject Loan")
+            .setStyle(ButtonStyle.Danger)
+
+          const row = new ActionRowBuilder().addComponents(acceptButton, rejectButton)
+
+          await interaction.reply({
+            content: `💳 **Loan Offer**\n\n${borrower}, ${lender.username} wants to lend you **${formatNumber(amount)}** points!\n\n**Terms:**\n• Interest rate: ${interest}%\n• Repayment period: ${days} days\n• Total to repay: **${formatNumber(totalOwed)}** points\n\nDo you accept this loan?`,
+            components: [row],
+          })
+          break
+        }
+
+        case "pay": {
+          const loanId = interaction.options.getInteger("loan_id")
+          const userPoints = await getUserPoints(user.id)
+
+          if (userPoints === null) {
+            await interaction.reply({
+              content: "❌ You must use `/participate` first to join the bot!",
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
+
+          const result = await payLoan(user.id, loanId, userPoints)
+          if (!result) {
+            await interaction.reply({
+              content: "❌ Loan not found or already paid!",
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
+
+          if (result.type === "full") {
+            await interaction.reply({
+              content: `✅ Loan paid in full! **${formatNumber(result.amount)}** points deducted from your balance.`,
+              flags: MessageFlags.Ephemeral,
+            })
+          } else if (result.type === "insufficient") {
+            await interaction.reply({
+              content: `❌ Insufficient points! You need **${formatNumber(result.needed)}** more points to pay this loan.`,
+              flags: MessageFlags.Ephemeral,
+            })
+          }
           break
         }
 
@@ -886,69 +1262,151 @@ client.on("interactionCreate", async (interaction) => {
   } else if (interaction.isButton()) {
     try {
       console.log(`Button clicked: ${interaction.customId}`)
-      const [action, poolId, optionIndex] = interaction.customId.split("_")
 
-      if (action === "bet") {
-        const poolIdInt = Number.parseInt(poolId)
-        const optionIndexInt = Number.parseInt(optionIndex)
+      if (interaction.customId.startsWith("accept_loan_")) {
+        const loanId = Number.parseInt(interaction.customId.split("_")[2])
 
-        console.log(`Bet button - Pool ID: ${poolIdInt}, Option Index: ${optionIndexInt}`)
-
-        // Check if pool is still active
-        const poolResult = await pool.query("SELECT * FROM betting_pools WHERE id = $1 AND status = $2", [
-          poolIdInt,
-          "active",
-        ])
-
-        if (!poolResult.rows.length) {
+        // Check if the user clicking is the borrower
+        const loanResult = await pool.query("SELECT * FROM loans WHERE id = $1", [loanId])
+        if (loanResult.rows.length === 0) {
           await interaction.reply({
-            content: "❌ This pool is closed or does not exist.",
+            content: "❌ Loan not found!",
             flags: MessageFlags.Ephemeral,
           })
           return
         }
 
-        // Check if user is registered
-        const userPoints = await getUserPoints(interaction.user.id)
-        if (userPoints === null) {
+        const loan = loanResult.rows[0]
+        if (loan.borrower_id !== interaction.user.id) {
           await interaction.reply({
-            content: "❌ You must use `/participate` first to join the bot!",
+            content: "❌ Only the borrower can accept this loan!",
             flags: MessageFlags.Ephemeral,
           })
           return
         }
 
-        // Check if user already has a bet
-        const existingBet = await getUserBet(interaction.user.id, poolIdInt)
-        if (existingBet) {
+        if (loan.status !== "pending") {
           await interaction.reply({
-            content: `❌ You already have a bet on this pool! You bet **${formatNumber(existingBet.amount)}** points on "${existingBet.option_text}". Bets cannot be changed once placed.`,
+            content: "❌ This loan has already been processed!",
             flags: MessageFlags.Ephemeral,
           })
           return
         }
 
-        const modal = new ModalBuilder()
-          .setCustomId(`bet_confirm_${poolIdInt}_${optionIndexInt}`)
-          .setTitle("Place Your Bet")
+        const acceptedLoan = await acceptLoan(loanId)
+        if (acceptedLoan) {
+          await interaction.update({
+            content: `✅ **Loan Accepted!**\n\n${interaction.user} has accepted the loan of **${formatNumber(acceptedLoan.amount)}** points!\n\n**Terms:**\n• Interest rate: ${acceptedLoan.interest_rate}%\n• Repayment period: ${acceptedLoan.days} days\n• Total to repay: **${formatNumber(Math.floor(acceptedLoan.amount * (1 + acceptedLoan.interest_rate / 100)))}** points\n\n💰 Points have been transferred!`,
+            components: [],
+          })
+        } else {
+          await interaction.reply({
+            content: "❌ Failed to accept loan. Please try again.",
+            flags: MessageFlags.Ephemeral,
+          })
+        }
+      } else if (interaction.customId.startsWith("reject_loan_")) {
+        const loanId = Number.parseInt(interaction.customId.split("_")[2])
 
-        const stakeInput = new TextInputBuilder()
-          .setCustomId("stake")
-          .setLabel("Stake Amount")
-          .setStyle(TextInputStyle.Short)
-          .setPlaceholder(`Enter points to stake (min: 10, max: ${formatNumber(userPoints)})`)
-          .setRequired(true)
+        // Check if the user clicking is the borrower
+        const loanResult = await pool.query("SELECT * FROM loans WHERE id = $1", [loanId])
+        if (loanResult.rows.length === 0) {
+          await interaction.reply({
+            content: "❌ Loan not found!",
+            flags: MessageFlags.Ephemeral,
+          })
+          return
+        }
 
-        modal.addComponents(new ActionRowBuilder().addComponents(stakeInput))
+        const loan = loanResult.rows[0]
+        if (loan.borrower_id !== interaction.user.id) {
+          await interaction.reply({
+            content: "❌ Only the borrower can reject this loan!",
+            flags: MessageFlags.Ephemeral,
+          })
+          return
+        }
 
-        console.log(`Showing betting modal for pool ${poolIdInt}, option ${optionIndexInt}`)
-        await interaction.showModal(modal)
+        if (loan.status !== "pending") {
+          await interaction.reply({
+            content: "❌ This loan has already been processed!",
+            flags: MessageFlags.Ephemeral,
+          })
+          return
+        }
+
+        await pool.query("UPDATE loans SET status = 'rejected' WHERE id = $1", [loanId])
+
+        await interaction.update({
+          content: `❌ **Loan Rejected**\n\n${interaction.user} has rejected the loan offer.`,
+          components: [],
+        })
+      } else {
+        // Handle betting buttons
+        const [action, poolId, optionIndex] = interaction.customId.split("_")
+
+        if (action === "bet") {
+          const poolIdInt = Number.parseInt(poolId)
+          const optionIndexInt = Number.parseInt(optionIndex)
+
+          console.log(`Bet button - Pool ID: ${poolIdInt}, Option Index: ${optionIndexInt}`)
+
+          // Check if pool is still active
+          const poolResult = await pool.query("SELECT * FROM betting_pools WHERE id = $1 AND status = $2", [
+            poolIdInt,
+            "active",
+          ])
+
+          if (!poolResult.rows.length) {
+            await interaction.reply({
+              content: "❌ This pool is closed or does not exist.",
+              flags: MessageFlags.Ephemeral,
+            })
+            return
+          }
+
+          // Check if user is registered
+          const userPoints = await getUserPoints(interaction.user.id)
+          if (userPoints === null) {
+            await interaction.reply({
+              content: "❌ You must use `/participate` first to join the bot!",
+              flags: MessageFlags.Ephemeral,
+            })
+            return
+          }
+
+          // Check if user already has a bet
+          const existingBet = await getUserBet(interaction.user.id, poolIdInt)
+          if (existingBet) {
+            await interaction.reply({
+              content: `❌ You already have a bet on this pool! You bet **${formatNumber(existingBet.amount)}** points on "${existingBet.option_text}". Bets cannot be changed once placed.`,
+              flags: MessageFlags.Ephemeral,
+            })
+            return
+          }
+
+          const modal = new ModalBuilder()
+            .setCustomId(`bet_confirm_${poolIdInt}_${optionIndexInt}`)
+            .setTitle("Place Your Bet")
+
+          const stakeInput = new TextInputBuilder()
+            .setCustomId("stake")
+            .setLabel("Stake Amount")
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder(`Enter points to stake (min: 10, max: ${formatNumber(userPoints)})`)
+            .setRequired(true)
+
+          modal.addComponents(new ActionRowBuilder().addComponents(stakeInput))
+
+          console.log(`Showing betting modal for pool ${poolIdInt}, option ${optionIndexInt}`)
+          await interaction.showModal(modal)
+        }
       }
     } catch (error) {
       console.error("Button interaction error:", error.stack)
       if (!interaction.replied && !interaction.deferred) {
         await interaction.reply({
-          content: "❌ An error occurred while processing your bet!",
+          content: "❌ An error occurred while processing your request!",
           flags: MessageFlags.Ephemeral,
         })
       }
