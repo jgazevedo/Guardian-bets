@@ -161,6 +161,18 @@ async function fixDatabase() {
       }
     }
 
+    // Fix loans table - add accepted_at column
+    try {
+      await pool.query(`ALTER TABLE loans ADD COLUMN accepted_at TIMESTAMP`)
+      console.log("✅ Added accepted_at column to loans table")
+    } catch (error) {
+      if (error.code === "42701") {
+        console.log("✅ accepted_at column already exists")
+      } else {
+        console.error("Error adding accepted_at column:", error)
+      }
+    }
+
     // Clean up any invalid loans (self-loans)
     try {
       const deleteResult = await pool.query("DELETE FROM loans WHERE lender_id = borrower_id RETURNING id")
@@ -447,12 +459,12 @@ async function clearLoansByStatus(status) {
   }
 }
 
-async function createPool(creatorId, title, description, options) {
+async function createPool(creatorId, title, options) {
   try {
-    const result = await pool.query(
-      "INSERT INTO betting_pools (creator_id, title, description) VALUES ($1, $2, $3) RETURNING id",
-      [creatorId, title, description || null],
-    )
+    const result = await pool.query("INSERT INTO betting_pools (creator_id, title) VALUES ($1, $2) RETURNING id", [
+      creatorId,
+      title,
+    ])
     const poolId = result.rows[0].id
 
     for (const { text, emoji } of options) {
@@ -471,7 +483,7 @@ async function createPool(creatorId, title, description, options) {
 
 async function getOpenPools(creatorId) {
   try {
-    return await pool.query("SELECT id, title, description FROM betting_pools WHERE status = $1", ["active"])
+    return await pool.query("SELECT id, title FROM betting_pools WHERE status = $1", ["active"])
   } catch (error) {
     console.error("Error getting open pools:", error)
     return { rows: [] }
@@ -484,7 +496,6 @@ async function getAllActiveBets() {
       SELECT 
         bp.id as pool_id,
         bp.title,
-        bp.description,
         bp.creator_id,
         po.id as option_id,
         po.option_text,
@@ -495,7 +506,7 @@ async function getAllActiveBets() {
       LEFT JOIN pool_options po ON bp.id = po.pool_id
       LEFT JOIN user_bets ub ON po.id = ub.option_id
       WHERE bp.status = 'active'
-      GROUP BY bp.id, bp.title, bp.description, bp.creator_id, po.id, po.option_text, po.emoji
+      GROUP BY bp.id, bp.title, bp.creator_id, po.id, po.option_text, po.emoji
       ORDER BY bp.created_at DESC, po.id ASC
     `)
     return result.rows
@@ -1058,7 +1069,6 @@ client.on("interactionCreate", async (interaction) => {
             if (!poolsMap.has(bet.pool_id)) {
               poolsMap.set(bet.pool_id, {
                 title: bet.title,
-                description: bet.description,
                 creator_id: bet.creator_id,
                 options: [],
                 totalStaked: 0,
@@ -1083,22 +1093,12 @@ client.on("interactionCreate", async (interaction) => {
           for (const [poolId, poolData] of poolsMap) {
             let optionsText = ""
             for (const option of poolData.options) {
-              optionsText += `${option.emoji || "•"} **${option.text}**: ${option.betCount} bets (${formatNumber(option.totalStaked)} points)
-`
+              optionsText += `${option.emoji || "•"} **${option.text}**: ${option.betCount} bets (${formatNumber(option.totalStaked)} points)\n`
             }
 
-            let fieldValue = ""
-            if (poolData.description) {
-              fieldValue += `*${poolData.description}*
-
-`
-            }
-            fieldValue += `**Options:**
-${optionsText}`
-            fieldValue += `
-**Total Pool:** ${formatNumber(poolData.totalStaked)} points`
-            fieldValue += `
-**Created by:** <@${poolData.creator_id}>`
+            let fieldValue = `**Options:**\n${optionsText}`
+            fieldValue += `\n**Total Pool:** ${formatNumber(poolData.totalStaked)} points`
+            fieldValue += `\n**Created by:** <@${poolData.creator_id}>`
 
             embed.addFields({
               name: `🎲 ${poolData.title}`,
@@ -1291,13 +1291,6 @@ Do you accept this loan?`,
             .setPlaceholder("Enter a title for your betting pool")
             .setRequired(true)
 
-          const descriptionInput = new TextInputBuilder()
-            .setCustomId("pool_description")
-            .setLabel("Betting Pool Description (Optional)")
-            .setStyle(TextInputStyle.Paragraph)
-            .setPlaceholder("Describe the pool's purpose, rules, or any relevant information...")
-            .setRequired(false)
-
           const option1Input = new TextInputBuilder()
             .setCustomId("option_1")
             .setLabel("Option 1 (text + emoji)")
@@ -1319,12 +1312,19 @@ Do you accept this loan?`,
             .setPlaceholder("e.g., Maybe 🤔")
             .setRequired(false)
 
+          const option4Input = new TextInputBuilder()
+            .setCustomId("option_4")
+            .setLabel("Option 4 (text + emoji) - Optional")
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder("e.g., Never 🚫")
+            .setRequired(false)
+
           modal.addComponents(
             new ActionRowBuilder().addComponents(titleInput),
-            new ActionRowBuilder().addComponents(descriptionInput),
             new ActionRowBuilder().addComponents(option1Input),
             new ActionRowBuilder().addComponents(option2Input),
             new ActionRowBuilder().addComponents(option3Input),
+            new ActionRowBuilder().addComponents(option4Input),
           )
 
           await interaction.showModal(modal)
@@ -1460,7 +1460,7 @@ Do you accept this loan?`,
               pools.rows.map((pool) => ({
                 label: pool.title.substring(0, 100),
                 value: pool.id.toString(),
-                description: pool.description ? pool.description.substring(0, 100) : "Click to close this pool",
+                description: "Click to close this pool",
               })),
             )
 
@@ -1541,11 +1541,10 @@ Do you accept this loan?`,
 
       if (customId === "create_pool_modal") {
         const title = fields.getTextInputValue("pool_title")
-        const description = fields.getTextInputValue("pool_description")?.trim() || null
         const options = []
 
-        // Process all options (2 required, 1 optional due to modal field limits)
-        for (let i = 1; i <= 3; i++) {
+        // Process all options (2 required, 2 optional)
+        for (let i = 1; i <= 4; i++) {
           try {
             const optionText = fields.getTextInputValue(`option_${i}`)
             if (optionText && optionText.trim()) {
@@ -1553,7 +1552,7 @@ Do you accept this loan?`,
               options.push(parsed)
             }
           } catch (error) {
-            // Option is empty or not provided (this is fine for option 3)
+            // Option is empty or not provided (this is fine for options 3 and 4)
             if (i <= 2) {
               // Options 1 and 2 are required
               await interaction.reply({
@@ -1573,7 +1572,7 @@ Do you accept this loan?`,
           return
         }
 
-        const poolId = await createPool(interaction.user.id, title, description, options)
+        const poolId = await createPool(interaction.user.id, title, options)
         if (!poolId) {
           await interaction.reply({
             content: "❌ Failed to create pool. Please try again.",
@@ -1596,14 +1595,8 @@ Do you accept this loan?`,
 
         const row = new ActionRowBuilder().addComponents(buttons)
 
-        // Build pool message content with description
-        let content = `🎲 **${title}**`
-        if (description) {
-          content += `
-
-*${description}*`
-        }
-        content += `
+        // Build pool message content
+        const content = `🎲 **${title}**
 
 *Created by <@${interaction.user.id}> • Betting closes in 5 minutes*`
 
@@ -1657,9 +1650,8 @@ Do you accept this loan?`,
           5 * 60 * 1000,
         ) // 5 minutes
 
-        const successMessage = `✅ Pool "${title}" created successfully!${description ? " Description added." : ""} Betting will close in 5 minutes, but the pool will remain open for manual closure.`
         await interaction.reply({
-          content: successMessage,
+          content: `✅ Pool "${title}" created successfully! Betting will close in 5 minutes, but the pool will remain open for manual closure.`,
           flags: MessageFlags.Ephemeral,
         })
       } else if (customId.startsWith("bet_confirm_")) {
