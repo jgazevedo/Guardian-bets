@@ -104,7 +104,7 @@ async function createPool(creatorId, title, description, options) {
     for (const { text, emoji } of options) {
       await pool.query(
         'INSERT INTO pool_options (pool_id, option_text, emoji) VALUES ($1, $2, $3)',
-        [poolId, text, emoji]
+        [poolId, text || 'Option', emoji || '']
       );
     }
     return poolId;
@@ -333,7 +333,7 @@ client.on('interactionCreate', async interaction => {
             new ActionRowBuilder().addComponents(creditsInput),
             new ActionRowBuilder().addComponents(balanceInfo)
           );
-          console.log('Showing modal for /add:', modal);
+          console.log('Showing modal for /add:', { customId: modal.customId, components: modal.components });
           await interaction.showModal(modal);
           break;
         }
@@ -368,7 +368,7 @@ client.on('interactionCreate', async interaction => {
             new ActionRowBuilder().addComponents(creditsInput),
             new ActionRowBuilder().addComponents(balanceInfo)
           );
-          console.log('Showing modal for /remove:', modal);
+          console.log('Showing modal for /remove:', { customId: modal.customId, components: modal.components });
           await interaction.showModal(modal);
           break;
         }
@@ -396,7 +396,7 @@ client.on('interactionCreate', async interaction => {
             new ActionRowBuilder().addComponents(descriptionInput),
             ...optionInputs.map(input => new ActionRowBuilder().addComponents(input))
           );
-          console.log('Showing modal for /create:', modal);
+          console.log('Showing modal for /create:', { customId: modal.customId, components: modal.components });
           await interaction.showModal(modal);
           break;
         }
@@ -421,7 +421,7 @@ client.on('interactionCreate', async interaction => {
             description: pool.description.substring(0, 50)
           })));
           const row = new ActionRowBuilder().addComponents(poolSelect);
-          console.log('Showing pool select for /close:', row);
+          console.log('Showing pool select for /close:', { customId: 'pool_select', components: [row] });
           await interaction.reply({ content: 'Select a pool to close:', components: [row], flags: MessageFlags.Ephemeral });
           break;
         }
@@ -481,9 +481,10 @@ client.on('interactionCreate', async interaction => {
           const optionText = fields.getTextInputValue(`option_${i}`);
           if (optionText) {
             const emojiMatch = optionText.match(/[\uD800-\uDBFF][\uDC00-\uDFFF]/);
-            options.push({ text: optionText.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/, '').trim(), emoji: emojiMatch ? emojiMatch[0] : '' });
+            options.push({ text: optionText.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/, '').trim() || `Option ${i}`, emoji: emojiMatch ? emojiMatch[0] : '' });
           }
         }
+        console.log('Creating pool with:', { description, options });
         if (options.length < 3 || !description) {
           await interaction.reply({ content: '❌ Please fill all fields with at least 3 options and a description.', flags: MessageFlags.Ephemeral });
           return;
@@ -498,7 +499,7 @@ client.on('interactionCreate', async interaction => {
           content: `**New Pool: ${description}**\n(Created by <@${interaction.user.id}>, closes in 3 minutes)`,
           components: [new ActionRowBuilder().addComponents(options.map((opt, i) => new ButtonBuilder()
             .setCustomId(`bet_${poolId}_${i}`)
-            .setLabel(opt.text || `Option ${i + 1}`)
+            .setLabel(opt.text)
             .setStyle(ButtonStyle.Primary)
             .setEmoji(opt.emoji)
           ))]
@@ -550,7 +551,7 @@ client.on('interactionCreate', async interaction => {
           .setPlaceholder('Enter points to stake (1-999999)')
           .setRequired(true);
         modal.addComponents(new ActionRowBuilder().addComponents(stakeInput));
-        console.log('Showing bet modal:', modal);
+        console.log('Showing bet modal:', { customId: modal.customId, components: modal.components });
         await interaction.showModal(modal);
       }
     } catch (error) {
@@ -576,7 +577,7 @@ client.on('interactionCreate', async interaction => {
           description: `Option ${i + 1}`
         })));
         const row = new ActionRowBuilder().addComponents(optionSelect);
-        console.log('Showing option select for /close:', row);
+        console.log('Showing option select for /close:', { customId: 'option_select', components: [row] });
         await interaction.update({ content: 'Select the correct answer:', components: [row], flags: MessageFlags.Ephemeral });
       } else if (interaction.customId.startsWith('close_confirm_')) {
         const poolId = interaction.customId.split('_')[2];
