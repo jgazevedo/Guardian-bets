@@ -1,21 +1,20 @@
 {
-  "name": "discord-bot",
-  "version": "2.0.0",
-  "description": "An enhanced Discord economy bot with improved UI/UX",
-  "main": "src/index.js",
-  "private": true,
+  "name": "discord-betting-bot",
+  "version": "1.0.0",
+  "description": "Discord betting bot with persistent PostgreSQL storage",
+  "main": "index.js",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node --watch src/index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "dev": "node index.js"
   },
   "dependencies": {
     "discord.js": "^14.14.1",
-    "dotenv": "^16.3.1",
-    "pg": "^8.11.3",
-    "node-cron": "^3.0.3"
+    "pg": "^8.11.3"
   },
-  "keywords": ["discord", "bot", "javascript", "economy"],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["discord", "bot", "postgresql", "railway"],
   "author": "Your Name",
   "license": "MIT"
 }
