@@ -235,7 +235,7 @@ client.on('interactionCreate', async interaction => {
             });
             break;
           }
-          const dailyBonus = 50;
+          const dailyBonus = 100; // Updated from 50 to 100
           const newPoints = currentPoints + dailyBonus;
           
           await updateUserPoints(user.id, newPoints);
@@ -294,7 +294,7 @@ client.on('interactionCreate', async interaction => {
             .setTitle('Add Credits');
           
           const userSelect = new UserSelectMenuBuilder()
-            .setCustomId('user_id')
+            .setCustomId('user_select')
             .setPlaceholder('Select a user')
             .setMinValues(1)
             .setMaxValues(1);
@@ -339,7 +339,7 @@ client.on('interactionCreate', async interaction => {
             .setTitle('Remove Credits');
           
           const userSelect = new UserSelectMenuBuilder()
-            .setCustomId('user_id')
+            .setCustomId('user_select')
             .setPlaceholder('Select a user')
             .setMinValues(1)
             .setMaxValues(1);
@@ -384,9 +384,22 @@ client.on('interactionCreate', async interaction => {
     }
   } else if (interaction.isModalSubmit()) {
     try {
-      if (interaction.customId === 'add_credits_modal') {
-        const userId = interaction.fields.getField('user_id').value;
-        const credits = parseInt(interaction.fields.getField('credits').value);
+      const { customId, fields, components } = interaction;
+      
+      if (customId === 'add_credits_modal' || customId === 'remove_credits_modal') {
+        // Extract the selected user ID from the user select menu
+        const userSelect = components[0].components[0];
+        const selectedUserId = userSelect.data.values ? userSelect.data.values[0] : null;
+        
+        if (!selectedUserId) {
+          await interaction.reply({
+            content: '❌ No user selected!',
+            ephemeral: true
+          });
+          return;
+        }
+        
+        const credits = parseInt(fields.getTextInputValue('credits'));
         
         if (isNaN(credits) || credits < 1 || credits > 999999) {
           await interaction.reply({
@@ -396,58 +409,38 @@ client.on('interactionCreate', async interaction => {
           return;
         }
         
-        const currentPoints = await getUserPoints(userId);
+        const currentPoints = await getUserPoints(selectedUserId);
         if (currentPoints === null) {
           await interaction.reply({
-            content: `❌ User <@${userId}> has not joined yet! They must use /participate first.`,
+            content: `❌ User <@${selectedUserId}> has not joined yet! They must use /participate first.`,
             ephemeral: true
           });
           return;
         }
         
-        const newPoints = currentPoints + credits;
-        await updateUserPoints(userId, newPoints);
-        
-        await interaction.reply({
-          content: `✅ Added **${formatNumber(credits)}** points to <@${userId}>!\n💰 New balance: **${formatNumber(newPoints)}** points`,
-          ephemeral: true
-        });
-      } else if (interaction.customId === 'remove_credits_modal') {
-        const userId = interaction.fields.getField('user_id').value;
-        const credits = parseInt(interaction.fields.getField('credits').value);
-        
-        if (isNaN(credits) || credits < 1 || credits > 999999) {
+        let newPoints;
+        if (customId === 'add_credits_modal') {
+          newPoints = currentPoints + credits;
+          await updateUserPoints(selectedUserId, newPoints);
           await interaction.reply({
-            content: '❌ Invalid credits amount! Must be a number between 1 and 999999.',
+            content: `✅ Added **${formatNumber(credits)}** points to <@${selectedUserId}>!\n💰 New balance: **${formatNumber(newPoints)}** points`,
             ephemeral: true
           });
-          return;
-        }
-        
-        const currentPoints = await getUserPoints(userId);
-        if (currentPoints === null) {
+        } else if (customId === 'remove_credits_modal') {
+          if (currentPoints < credits) {
+            await interaction.reply({
+              content: `❌ User <@${selectedUserId}> only has **${formatNumber(currentPoints)}** points! Cannot remove **${formatNumber(credits)}** points.`,
+              ephemeral: true
+            });
+            return;
+          }
+          newPoints = currentPoints - credits;
+          await updateUserPoints(selectedUserId, newPoints);
           await interaction.reply({
-            content: `❌ User <@${userId}> has not joined yet! They must use /participate first.`,
+            content: `✅ Removed **${formatNumber(credits)}** points from <@${selectedUserId}>!\n💰 New balance: **${formatNumber(newPoints)}** points`,
             ephemeral: true
           });
-          return;
         }
-        
-        if (currentPoints < credits) {
-          await interaction.reply({
-            content: `❌ User <@${userId}> only has **${formatNumber(currentPoints)}** points! Cannot remove **${formatNumber(credits)}** points.`,
-            ephemeral: true
-          });
-          return;
-        }
-        
-        const newPoints = currentPoints - credits;
-        await updateUserPoints(userId, newPoints);
-        
-        await interaction.reply({
-          content: `✅ Removed **${formatNumber(credits)}** points from <@${userId}>!\n💰 New balance: **${formatNumber(newPoints)}** points`,
-          ephemeral: true
-        });
       }
     } catch (error) {
       console.error('Modal submission error:', error);
