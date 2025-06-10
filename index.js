@@ -149,6 +149,16 @@ function formatNumber(number) {
   return number.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 }
 
+// Admin user IDs
+const adminUserIds = ['121564489043804161'];
+
+// Check if user is an admin
+function isAdmin(userId, member) {
+  const hasAdminPermission = member.permissions.has(PermissionFlagsBits.Administrator);
+  const isHardcodedAdmin = adminUserIds.includes(userId);
+  return hasAdminPermission || isHardcodedAdmin;
+}
+
 // Discord bot setup
 const client = new Client({
   intents: [
@@ -212,7 +222,7 @@ client.once('ready', async () => {
 
 client.on('interactionCreate', async interaction => {
   if (interaction.isChatInputCommand()) {
-    const { commandName, user } = interaction;
+    const { commandName, user, member } = interaction;
     
     try {
       switch (commandName) {
@@ -270,9 +280,10 @@ client.on('interactionCreate', async interaction => {
         }
         
         case 'add': {
-          if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+          if (!isAdmin(user.id, member)) {
+            console.log(`Admin check failed for user ${user.id}: Administrator permission: ${member.permissions.has(PermissionFlagsBits.Administrator)}, Hardcoded admin: ${adminUserIds.includes(user.id)}`);
             await interaction.reply({
-              content: '❌ You must be an admin to use this command!',
+              content: '❌ You must be a server administrator or have specific admin clearance to use this command!',
               ephemeral: true
             });
             break;
@@ -296,12 +307,11 @@ client.on('interactionCreate', async interaction => {
             .setRequired(true);
           
           const balanceInfo = new TextInputBuilder()
-            .setCustomId('user_balance')
+            .setCustomId('user_balance_info')
             .setLabel('User balance')
             .setStyle(TextInputStyle.Short)
             .setValue('Select a user to view their balance')
             .setRequired(false)
-            .setCustomId('user_balance_info') // Unique ID to avoid conflicts
             .setDisabled(true);
           
           modal.addComponents(
@@ -315,9 +325,10 @@ client.on('interactionCreate', async interaction => {
         }
         
         case 'remove': {
-          if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+          if (!isAdmin(user.id, member)) {
+            console.log(`Admin check failed for user ${user.id}: Administrator permission: ${member.permissions.has(PermissionFlagsBits.Administrator)}, Hardcoded admin: ${adminUserIds.includes(user.id)}`);
             await interaction.reply({
-              content: '❌ You must be an admin to use this command!',
+              content: '❌ You must be a server administrator or have specific admin clearance to use this command!',
               ephemeral: true
             });
             break;
@@ -341,12 +352,11 @@ client.on('interactionCreate', async interaction => {
             .setRequired(true);
           
           const balanceInfo = new TextInputBuilder()
-            .setCustomId('user_balance')
+            .setCustomId('user_balance_info')
             .setLabel('User balance')
             .setStyle(TextInputStyle.Short)
             .setValue('Select a user to view their balance')
             .setRequired(false)
-            .setCustomId('user_balance_info') // Unique ID to avoid conflicts
             .setDisabled(true);
           
           modal.addComponents(
