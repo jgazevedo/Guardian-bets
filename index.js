@@ -194,23 +194,13 @@ async function recordBet(userId, poolId, optionId, amount) {
     const existingBet = await getUserBet(userId, poolId)
 
     if (existingBet) {
-      // Update existing bet
-      await pool.query(
-        `UPDATE user_bets 
-         SET option_id = $1, amount = $2, locked_at = NULL, created_at = CURRENT_TIMESTAMP 
-         WHERE user_id = $3 AND pool_id = $4`,
-        [optionId, amount, userId, poolId],
-      )
-
-      // Refund previous bet amount and charge new amount
-      const currentPoints = await getUserPoints(userId)
-      const pointsDifference = amount - existingBet.amount
-      await updateUserPoints(userId, currentPoints - pointsDifference)
+      // User already has a bet - don't allow changes
+      return false
     } else {
-      // Insert new bet
+      // Insert new bet and lock it immediately
       await pool.query(
         `INSERT INTO user_bets (user_id, pool_id, option_id, amount, locked_at) 
-         VALUES ($1, $2, $3, $4, NULL)`,
+         VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)`,
         [userId, poolId, optionId, amount],
       )
 
@@ -306,7 +296,7 @@ async function closePool(poolId, correctOptionId) {
     // Calculate totals
     const totalStaked = allBets.rows.reduce((sum, bet) => sum + bet.amount, 0)
     const totalWinningStake = winningBets.reduce((sum, bet) => sum + bet.amount, 0)
-    const totalPayout = totalStaked // Changed from Math.floor(totalStaked * 0.9) to totalStaked for 100% payout
+    const totalPayout = totalStaked // 100% payout
 
     console.log(
       `Total staked: ${totalStaked}, Total winning stake: ${totalWinningStake}, Total payout: ${totalPayout} (100% payout)`,
@@ -361,7 +351,6 @@ function isAdmin(userId, member) {
 
 // Pool state management
 const activePools = new Map()
-const betTimeouts = new Map()
 
 // Discord bot setup
 const client = new Client({
@@ -529,10 +518,9 @@ client.on("interactionCreate", async (interaction) => {
             .setFooter({ text: `Balance: ${formatNumber(userPoints)} points` })
 
           for (const bet of activeBets.rows) {
-            const status = bet.locked_at ? "🔒 Locked" : "⏰ Can change (30s)"
             embed.addFields({
               name: bet.title,
-              value: `**Bet:** ${formatNumber(bet.amount)} points on "${bet.option_text}" ${bet.emoji || ""}\n**Status:** ${status}`,
+              value: `**Bet:** ${formatNumber(bet.amount)} points on "${bet.option_text}" ${bet.emoji || ""}\n**Status:** 🔒 Locked`,
               inline: false,
             })
           }
@@ -845,17 +833,16 @@ client.on("interactionCreate", async (interaction) => {
 
         // Check if user has existing bet
         const existingBet = await getUserBet(userId, poolId)
-
-        // Calculate the actual cost difference
-        let totalCost
         if (existingBet) {
-          totalCost = stake - existingBet.amount // Difference between new and old bet
-        } else {
-          totalCost = stake // Full amount for new bet
+          await interaction.reply({
+            content: `❌ You already have a bet on this pool! You bet **${formatNumber(existingBet.amount)}** points on "${existingBet.option_text}". Bets cannot be changed once placed.`,
+            flags: MessageFlags.Ephemeral,
+          })
+          return
         }
 
-        if (currentPoints < totalCost) {
-          const needed = totalCost - currentPoints
+        if (currentPoints < stake) {
+          const needed = stake - currentPoints
           await interaction.reply({
             content: `❌ Insufficient points! You need **${formatNumber(needed)}** more points.`,
             flags: MessageFlags.Ephemeral,
@@ -876,25 +863,8 @@ client.on("interactionCreate", async (interaction) => {
         const success = await recordBet(userId, poolId, optionId, stake)
 
         if (success) {
-          // Clear any existing timeout for this user and pool
-          const timeoutKey = `${userId}_${poolId}`
-          if (betTimeouts.has(timeoutKey)) {
-            clearTimeout(betTimeouts.get(timeoutKey))
-          }
-
-          // Set new timeout to lock bet after 30 seconds
-          betTimeouts.set(
-            timeoutKey,
-            setTimeout(() => {
-              lockBet(userId, poolId)
-              betTimeouts.delete(timeoutKey)
-              console.log(`Auto-locked bet for user ${userId} on pool ${poolId} after 30 seconds`)
-            }, 30 * 1000),
-          )
-
-          const actionText = existingBet ? "updated" : "placed"
           await interaction.reply({
-            content: `✅ Bet ${actionText}! **${formatNumber(stake)}** points on "${optionsResult.rows[optionIndex].option_text}"!\n⏰ You have 30 seconds to change or cancel this bet.`,
+            content: `✅ Bet placed! **${formatNumber(stake)}** points on "${optionsResult.rows[optionIndex].option_text}"!\n🔒 Your bet is now locked and cannot be changed.`,
             flags: MessageFlags.Ephemeral,
           })
         } else {
@@ -948,12 +918,19 @@ client.on("interactionCreate", async (interaction) => {
           return
         }
 
-        // Check existing bet
+        // Check if user already has a bet
         const existingBet = await getUserBet(interaction.user.id, poolIdInt)
+        if (existingBet) {
+          await interaction.reply({
+            content: `❌ You already have a bet on this pool! You bet **${formatNumber(existingBet.amount)}** points on "${existingBet.option_text}". Bets cannot be changed once placed.`,
+            flags: MessageFlags.Ephemeral,
+          })
+          return
+        }
 
         const modal = new ModalBuilder()
           .setCustomId(`bet_confirm_${poolIdInt}_${optionIndexInt}`)
-          .setTitle(existingBet ? "Update Your Bet" : "Place Your Bet")
+          .setTitle("Place Your Bet")
 
         const stakeInput = new TextInputBuilder()
           .setCustomId("stake")
@@ -962,29 +939,10 @@ client.on("interactionCreate", async (interaction) => {
           .setPlaceholder(`Enter points to stake (min: 10, max: ${formatNumber(userPoints)})`)
           .setRequired(true)
 
-        if (existingBet) {
-          stakeInput.setValue(existingBet.amount.toString())
-        }
-
         modal.addComponents(new ActionRowBuilder().addComponents(stakeInput))
 
         console.log(`Showing betting modal for pool ${poolIdInt}, option ${optionIndexInt}`)
         await interaction.showModal(modal)
-      } else if (action === "cancel") {
-        const poolIdInt = Number.parseInt(poolId)
-        const refund = await cancelBet(interaction.user.id, poolIdInt)
-
-        if (refund > 0) {
-          await interaction.reply({
-            content: `✅ Bet cancelled! **${formatNumber(refund)}** points refunded.`,
-            flags: MessageFlags.Ephemeral,
-          })
-        } else {
-          await interaction.reply({
-            content: "❌ No active bet found or bet is already locked.",
-            flags: MessageFlags.Ephemeral,
-          })
-        }
       }
     } catch (error) {
       console.error("Button interaction error:", error.stack)
@@ -1084,4 +1042,3 @@ process.on("SIGINT", async () => {
   client.destroy()
   process.exit(0)
 })
-
