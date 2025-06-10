@@ -44,7 +44,8 @@ async function initDatabase() {
         status VARCHAR(20) DEFAULT 'active',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         message_id VARCHAR(20),
-        channel_id VARCHAR(20)
+        channel_id VARCHAR(20),
+        description TEXT
       )
     `)
 
@@ -88,17 +89,20 @@ async function initDatabase() {
     // Add unique constraint if it doesn't exist
     try {
       await pool.query(`
-        ALTER TABLE user_bets 
-        ADD CONSTRAINT user_bets_user_pool_unique 
-        UNIQUE (user_id, pool_id)
-      `)
-      console.log("✅ Added unique constraint to user_bets table")
+    DO $$ 
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints 
+                       WHERE constraint_name = 'user_bets_user_pool_unique') THEN
+            ALTER TABLE user_bets ADD CONSTRAINT user_bets_user_pool_unique UNIQUE (user_id, pool_id);
+            RAISE NOTICE 'Added unique constraint to user_bets table';
+        ELSE
+            RAISE NOTICE 'Unique constraint already exists';
+        END IF;
+    END $$;
+  `)
+      console.log("✅ Unique constraint handled successfully")
     } catch (error) {
-      if (error.code === "42P07") {
-        console.log("✅ Unique constraint already exists")
-      } else {
-        console.error("Error adding unique constraint:", error)
-      }
+      console.error("Error handling unique constraint:", error)
     }
 
     console.log("✅ Database initialized successfully")
@@ -252,11 +256,14 @@ async function createLoan(lenderId, borrowerId, amount, interestRate, days) {
     // Ensure interestRate is an integer to avoid overflow
     const integerInterestRate = Math.floor(interestRate)
 
+    // Only create the loan record - DO NOT deduct points yet
     const result = await pool.query(
-      `INSERT INTO loans (lender_id, borrower_id, amount, interest_rate, days, due_date) 
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+      `INSERT INTO loans (lender_id, borrower_id, amount, interest_rate, days, due_date, status) 
+       VALUES ($1, $2, $3, $4, $5, $6, 'pending') RETURNING id`,
       [lenderId, borrowerId, amount, integerInterestRate, days, dueDate],
     )
+
+    console.log(`Created loan offer ${result.rows[0].id}: ${amount} points from ${lenderId} to ${borrowerId}`)
     return result.rows[0].id
   } catch (error) {
     console.error("Error creating loan:", error)
@@ -266,37 +273,64 @@ async function createLoan(lenderId, borrowerId, amount, interestRate, days) {
 
 async function acceptLoan(loanId) {
   try {
+    // First, check if loan exists and is still pending
+    const loanCheck = await pool.query("SELECT * FROM loans WHERE id = $1", [loanId])
+    if (loanCheck.rows.length === 0) {
+      console.log(`Loan ${loanId} not found`)
+      return null
+    }
+
+    const loan = loanCheck.rows[0]
+    if (loan.status !== "pending") {
+      console.log(`Loan ${loanId} is not pending (status: ${loan.status})`)
+      return null
+    }
+
+    // Check if lender still has enough points
+    const lenderPoints = await getUserPoints(loan.lender_id)
+    const borrowerPoints = await getUserPoints(loan.borrower_id)
+
+    if (lenderPoints === null || borrowerPoints === null) {
+      console.log(`User points not found - lender: ${lenderPoints}, borrower: ${borrowerPoints}`)
+      return null
+    }
+
+    if (lenderPoints < loan.amount) {
+      console.log(`Lender ${loan.lender_id} has insufficient points: ${lenderPoints} < ${loan.amount}`)
+      return null
+    }
+
+    // Update loan status to active and set accepted timestamp
     const result = await pool.query(
       `UPDATE loans SET status = 'active', accepted_at = CURRENT_TIMESTAMP 
        WHERE id = $1 AND status = 'pending' RETURNING *`,
       [loanId],
     )
 
-    if (result.rows.length > 0) {
-      const loan = result.rows[0]
-
-      // Transfer points from lender to borrower
-      const lenderPoints = await getUserPoints(loan.lender_id)
-      const borrowerPoints = await getUserPoints(loan.borrower_id)
-
-      if (lenderPoints < loan.amount) {
-        return null // Lender doesn't have enough points
-      }
-
-      await updateUserPoints(loan.lender_id, lenderPoints - loan.amount)
-      await updateUserPoints(loan.borrower_id, borrowerPoints + loan.amount)
-
-      // Set up auto-collection timer
-      const timeUntilDue = new Date(loan.due_date) - new Date()
-      if (timeUntilDue > 0) {
-        setTimeout(() => {
-          collectLoan(loanId)
-        }, timeUntilDue)
-      }
-
-      return loan
+    if (result.rows.length === 0) {
+      console.log(`Failed to update loan ${loanId} - may have been processed by another request`)
+      return null
     }
-    return null
+
+    const updatedLoan = result.rows[0]
+
+    // Now transfer the points
+    await updateUserPoints(loan.lender_id, lenderPoints - loan.amount)
+    await updateUserPoints(loan.borrower_id, borrowerPoints + loan.amount)
+
+    console.log(
+      `Loan ${loanId} accepted: transferred ${loan.amount} points from ${loan.lender_id} to ${loan.borrower_id}`,
+    )
+
+    // Set up auto-collection timer
+    const timeUntilDue = new Date(updatedLoan.due_date) - new Date()
+    if (timeUntilDue > 0) {
+      setTimeout(() => {
+        collectLoan(loanId)
+      }, timeUntilDue)
+    }
+
+    return updatedLoan
   } catch (error) {
     console.error("Error accepting loan:", error)
     return null
@@ -413,12 +447,12 @@ async function clearLoansByStatus(status) {
   }
 }
 
-async function createPool(creatorId, title, options) {
+async function createPool(creatorId, title, description, options) {
   try {
-    const result = await pool.query("INSERT INTO betting_pools (creator_id, title) VALUES ($1, $2) RETURNING id", [
-      creatorId,
-      title,
-    ])
+    const result = await pool.query(
+      "INSERT INTO betting_pools (creator_id, title, description) VALUES ($1, $2, $3) RETURNING id",
+      [creatorId, title, description || null],
+    )
     const poolId = result.rows[0].id
 
     for (const { text, emoji } of options) {
@@ -437,7 +471,7 @@ async function createPool(creatorId, title, options) {
 
 async function getOpenPools(creatorId) {
   try {
-    return await pool.query("SELECT id, title FROM betting_pools WHERE status = $1", ["active"])
+    return await pool.query("SELECT id, title, description FROM betting_pools WHERE status = $1", ["active"])
   } catch (error) {
     console.error("Error getting open pools:", error)
     return { rows: [] }
@@ -450,6 +484,7 @@ async function getAllActiveBets() {
       SELECT 
         bp.id as pool_id,
         bp.title,
+        bp.description,
         bp.creator_id,
         po.id as option_id,
         po.option_text,
@@ -460,7 +495,7 @@ async function getAllActiveBets() {
       LEFT JOIN pool_options po ON bp.id = po.pool_id
       LEFT JOIN user_bets ub ON po.id = ub.option_id
       WHERE bp.status = 'active'
-      GROUP BY bp.id, bp.title, bp.creator_id, po.id, po.option_text, po.emoji
+      GROUP BY bp.id, bp.title, bp.description, bp.creator_id, po.id, po.option_text, po.emoji
       ORDER BY bp.created_at DESC, po.id ASC
     `)
     return result.rows
@@ -920,7 +955,8 @@ client.on("interactionCreate", async (interaction) => {
           await claimDaily(user.id)
 
           await interaction.reply({
-            content: `🎁 **Daily bonus claimed!** You received **${dailyBonus}** points!\n💰 New balance: **${formatNumber(newPoints)}** points`,
+            content: `🎁 **Daily bonus claimed!** You received **${dailyBonus}** points!
+💰 New balance: **${formatNumber(newPoints)}** points`,
             flags: MessageFlags.Ephemeral,
           })
           break
@@ -994,7 +1030,8 @@ client.on("interactionCreate", async (interaction) => {
           for (const bet of activeBets.rows) {
             embed.addFields({
               name: bet.title,
-              value: `**Bet:** ${formatNumber(bet.amount)} points on "${bet.option_text}" ${bet.emoji || ""}\n**Status:** 🔒 Locked`,
+              value: `**Bet:** ${formatNumber(bet.amount)} points on "${bet.option_text}" ${bet.emoji || ""}
+**Status:** 🔒 Locked`,
               inline: false,
             })
           }
@@ -1021,6 +1058,7 @@ client.on("interactionCreate", async (interaction) => {
             if (!poolsMap.has(bet.pool_id)) {
               poolsMap.set(bet.pool_id, {
                 title: bet.title,
+                description: bet.description,
                 creator_id: bet.creator_id,
                 options: [],
                 totalStaked: 0,
@@ -1045,12 +1083,22 @@ client.on("interactionCreate", async (interaction) => {
           for (const [poolId, poolData] of poolsMap) {
             let optionsText = ""
             for (const option of poolData.options) {
-              optionsText += `${option.emoji || "•"} **${option.text}**: ${option.betCount} bets (${formatNumber(option.totalStaked)} points)\n`
+              optionsText += `${option.emoji || "•"} **${option.text}**: ${option.betCount} bets (${formatNumber(option.totalStaked)} points)
+`
             }
 
-            let fieldValue = `**Options:**\n${optionsText}`
-            fieldValue += `\n**Total Pool:** ${formatNumber(poolData.totalStaked)} points`
-            fieldValue += `\n**Created by:** <@${poolData.creator_id}>`
+            let fieldValue = ""
+            if (poolData.description) {
+              fieldValue += `*${poolData.description}*
+
+`
+            }
+            fieldValue += `**Options:**
+${optionsText}`
+            fieldValue += `
+**Total Pool:** ${formatNumber(poolData.totalStaked)} points`
+            fieldValue += `
+**Created by:** <@${poolData.creator_id}>`
 
             embed.addFields({
               name: `🎲 ${poolData.title}`,
@@ -1094,13 +1142,21 @@ client.on("interactionCreate", async (interaction) => {
             if (loan.role === "borrower") {
               embed.addFields({
                 name: `💸 Borrowed (ID: ${loan.id})`,
-                value: `**Amount:** ${formatNumber(loan.amount)} points\n**Interest:** ${loan.interest_rate}%\n**Total to pay:** ${formatNumber(totalOwed)} points\n**Due:** ${dueDate}\n**Status:** ${loan.status}`,
+                value: `**Amount:** ${formatNumber(loan.amount)} points
+**Interest:** ${loan.interest_rate}%
+**Total to pay:** ${formatNumber(totalOwed)} points
+**Due:** ${dueDate}
+**Status:** ${loan.status}`,
                 inline: false,
               })
             } else {
               embed.addFields({
                 name: `💰 Lent (ID: ${loan.id})`,
-                value: `**Amount:** ${formatNumber(loan.amount)} points\n**Interest:** ${loan.interest_rate}%\n**Will receive:** ${formatNumber(totalOwed)} points\n**Due:** ${dueDate}\n**Status:** ${loan.status}`,
+                value: `**Amount:** ${formatNumber(loan.amount)} points
+**Interest:** ${loan.interest_rate}%
+**Will receive:** ${formatNumber(totalOwed)} points
+**Due:** ${dueDate}
+**Status:** ${loan.status}`,
                 inline: false,
               })
             }
@@ -1175,7 +1231,16 @@ client.on("interactionCreate", async (interaction) => {
           const row = new ActionRowBuilder().addComponents(acceptButton, rejectButton)
 
           await interaction.reply({
-            content: `💳 **Loan Offer**\n\n${borrower}, ${lender.username} wants to lend you **${formatNumber(amount)}** points!\n\n**Terms:**\n• Interest rate: ${interest}%\n• Repayment period: ${days} days\n• Total to repay: **${formatNumber(totalOwed)}** points\n\nDo you accept this loan?`,
+            content: `💳 **Loan Offer**
+
+${borrower}, ${lender.username} wants to lend you **${formatNumber(amount)}** points!
+
+**Terms:**
+• Interest rate: ${interest}%
+• Repayment period: ${days} days
+• Total to repay: **${formatNumber(totalOwed)}** points
+
+Do you accept this loan?`,
             components: [row],
           })
           break
@@ -1226,6 +1291,13 @@ client.on("interactionCreate", async (interaction) => {
             .setPlaceholder("Enter a title for your betting pool")
             .setRequired(true)
 
+          const descriptionInput = new TextInputBuilder()
+            .setCustomId("pool_description")
+            .setLabel("Betting Pool Description (Optional)")
+            .setStyle(TextInputStyle.Paragraph)
+            .setPlaceholder("Describe the pool's purpose, rules, or any relevant information...")
+            .setRequired(false)
+
           const option1Input = new TextInputBuilder()
             .setCustomId("option_1")
             .setLabel("Option 1 (text + emoji)")
@@ -1247,19 +1319,12 @@ client.on("interactionCreate", async (interaction) => {
             .setPlaceholder("e.g., Maybe 🤔")
             .setRequired(false)
 
-          const option4Input = new TextInputBuilder()
-            .setCustomId("option_4")
-            .setLabel("Option 4 (text + emoji) - Optional")
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder("e.g., Never 🚫")
-            .setRequired(false)
-
           modal.addComponents(
             new ActionRowBuilder().addComponents(titleInput),
+            new ActionRowBuilder().addComponents(descriptionInput),
             new ActionRowBuilder().addComponents(option1Input),
             new ActionRowBuilder().addComponents(option2Input),
             new ActionRowBuilder().addComponents(option3Input),
-            new ActionRowBuilder().addComponents(option4Input),
           )
 
           await interaction.showModal(modal)
@@ -1326,7 +1391,8 @@ client.on("interactionCreate", async (interaction) => {
           await updateUserPoints(targetUser.id, newPoints)
 
           await interaction.reply({
-            content: `✅ Added **${formatNumber(amount)}** points to ${targetUser}!\n💰 New balance: **${formatNumber(newPoints)}** points`,
+            content: `✅ Added **${formatNumber(amount)}** points to ${targetUser}!
+💰 New balance: **${formatNumber(newPoints)}** points`,
             flags: MessageFlags.Ephemeral,
           })
           break
@@ -1365,7 +1431,8 @@ client.on("interactionCreate", async (interaction) => {
           await updateUserPoints(targetUser.id, newPoints)
 
           await interaction.reply({
-            content: `✅ Removed **${formatNumber(amount)}** points from ${targetUser}!\n💰 New balance: **${formatNumber(newPoints)}** points`,
+            content: `✅ Removed **${formatNumber(amount)}** points from ${targetUser}!
+💰 New balance: **${formatNumber(newPoints)}** points`,
             flags: MessageFlags.Ephemeral,
           })
           break
@@ -1393,7 +1460,7 @@ client.on("interactionCreate", async (interaction) => {
               pools.rows.map((pool) => ({
                 label: pool.title.substring(0, 100),
                 value: pool.id.toString(),
-                description: "Click to close this pool",
+                description: pool.description ? pool.description.substring(0, 100) : "Click to close this pool",
               })),
             )
 
@@ -1423,7 +1490,11 @@ client.on("interactionCreate", async (interaction) => {
 
             if (clearedLoan) {
               await interaction.reply({
-                content: `✅ Successfully cleared loan #${loanId}:\n• Lender: <@${clearedLoan.lender_id}>\n• Borrower: <@${clearedLoan.borrower_id}>\n• Amount: ${formatNumber(clearedLoan.amount)} points\n• Status: ${clearedLoan.status}`,
+                content: `✅ Successfully cleared loan #${loanId}:
+• Lender: <@${clearedLoan.lender_id}>
+• Borrower: <@${clearedLoan.borrower_id}>
+• Amount: ${formatNumber(clearedLoan.amount)} points
+• Status: ${clearedLoan.status}`,
                 flags: MessageFlags.Ephemeral,
               })
             } else {
@@ -1470,10 +1541,11 @@ client.on("interactionCreate", async (interaction) => {
 
       if (customId === "create_pool_modal") {
         const title = fields.getTextInputValue("pool_title")
+        const description = fields.getTextInputValue("pool_description")?.trim() || null
         const options = []
 
-        // Process all options (2 required, 2 optional)
-        for (let i = 1; i <= 4; i++) {
+        // Process all options (2 required, 1 optional due to modal field limits)
+        for (let i = 1; i <= 3; i++) {
           try {
             const optionText = fields.getTextInputValue(`option_${i}`)
             if (optionText && optionText.trim()) {
@@ -1481,7 +1553,7 @@ client.on("interactionCreate", async (interaction) => {
               options.push(parsed)
             }
           } catch (error) {
-            // Option is empty or not provided (this is fine for options 3 and 4)
+            // Option is empty or not provided (this is fine for option 3)
             if (i <= 2) {
               // Options 1 and 2 are required
               await interaction.reply({
@@ -1501,7 +1573,7 @@ client.on("interactionCreate", async (interaction) => {
           return
         }
 
-        const poolId = await createPool(interaction.user.id, title, options)
+        const poolId = await createPool(interaction.user.id, title, description, options)
         if (!poolId) {
           await interaction.reply({
             content: "❌ Failed to create pool. Please try again.",
@@ -1510,7 +1582,7 @@ client.on("interactionCreate", async (interaction) => {
           return
         }
 
-        // Create betting buttons (max 5 per row, so we'll use 4)
+        // Create betting buttons (max 5 per row, so we'll use up to 3)
         const buttons = options.map((opt, i) => {
           const button = new ButtonBuilder()
             .setCustomId(`bet_${poolId}_${i}`)
@@ -1524,8 +1596,16 @@ client.on("interactionCreate", async (interaction) => {
 
         const row = new ActionRowBuilder().addComponents(buttons)
 
-        // Build pool message content
-        const content = `🎲 **${title}**\n\n*Created by <@${interaction.user.id}> • Betting closes in 5 minutes*`
+        // Build pool message content with description
+        let content = `🎲 **${title}**`
+        if (description) {
+          content += `
+
+*${description}*`
+        }
+        content += `
+
+*Created by <@${interaction.user.id}> • Betting closes in 5 minutes*`
 
         // Send the pool message
         const channel = interaction.channel
@@ -1577,8 +1657,9 @@ client.on("interactionCreate", async (interaction) => {
           5 * 60 * 1000,
         ) // 5 minutes
 
+        const successMessage = `✅ Pool "${title}" created successfully!${description ? " Description added." : ""} Betting will close in 5 minutes, but the pool will remain open for manual closure.`
         await interaction.reply({
-          content: `✅ Pool "${title}" created successfully! Betting will close in 5 minutes, but the pool will remain open for manual closure.`,
+          content: successMessage,
           flags: MessageFlags.Ephemeral,
         })
       } else if (customId.startsWith("bet_confirm_")) {
@@ -1639,7 +1720,8 @@ client.on("interactionCreate", async (interaction) => {
 
         if (success) {
           await interaction.reply({
-            content: `✅ Bet placed! **${formatNumber(stake)}** points on "${optionsResult.rows[optionIndex].option_text}"!\n🔒 Your bet is now locked and cannot be changed.`,
+            content: `✅ Bet placed! **${formatNumber(stake)}** points on "${optionsResult.rows[optionIndex].option_text}"!
+🔒 Your bet is now locked and cannot be changed.`,
             flags: MessageFlags.Ephemeral,
           })
         } else {
@@ -1686,22 +1768,35 @@ client.on("interactionCreate", async (interaction) => {
 
         if (loan.status !== "pending") {
           await interaction.reply({
-            content: "❌ This loan has already been processed!",
+            content: `❌ This loan is no longer available (Status: ${loan.status})`,
             flags: MessageFlags.Ephemeral,
           })
           return
         }
 
+        // Defer the reply to prevent timeout
+        await interaction.deferUpdate()
+
         const acceptedLoan = await acceptLoan(loanId)
         if (acceptedLoan) {
-          await interaction.update({
-            content: `✅ **Loan Accepted!**\n\n${interaction.user} has accepted the loan of **${formatNumber(acceptedLoan.amount)}** points!\n\n**Terms:**\n• Interest rate: ${acceptedLoan.interest_rate}%\n• Repayment period: ${acceptedLoan.days} days\n• Total to repay: **${formatNumber(Math.floor(acceptedLoan.amount * (1 + acceptedLoan.interest_rate / 100)))}** points\n\n💰 Points have been transferred!`,
+          await interaction.editReply({
+            content: `✅ **Loan Accepted!**
+
+${interaction.user} has accepted the loan of **${formatNumber(acceptedLoan.amount)}** points!
+
+**Terms:**
+• Interest rate: ${acceptedLoan.interest_rate}%
+• Repayment period: ${acceptedLoan.days} days
+• Total to repay: **${formatNumber(Math.floor(acceptedLoan.amount * (1 + acceptedLoan.interest_rate / 100)))}** points
+
+💰 Points have been transferred!`,
             components: [],
           })
         } else {
-          await interaction.reply({
-            content: "❌ Failed to accept loan. The lender may not have enough points.",
-            flags: MessageFlags.Ephemeral,
+          await interaction.editReply({
+            content:
+              "❌ Failed to accept loan. The lender may not have enough points or the loan was already processed.",
+            components: [],
           })
         }
       } else if (interaction.customId.startsWith("reject_loan_")) {
@@ -1728,7 +1823,7 @@ client.on("interactionCreate", async (interaction) => {
 
         if (loan.status !== "pending") {
           await interaction.reply({
-            content: "❌ This loan has already been processed!",
+            content: `❌ This loan is no longer available (Status: ${loan.status})`,
             flags: MessageFlags.Ephemeral,
           })
           return
@@ -1737,7 +1832,9 @@ client.on("interactionCreate", async (interaction) => {
         await pool.query("UPDATE loans SET status = 'rejected' WHERE id = $1", [loanId])
 
         await interaction.update({
-          content: `❌ **Loan Rejected**\n\n${interaction.user} has rejected the loan offer.`,
+          content: `❌ **Loan Rejected**
+
+${interaction.user} has rejected the loan offer.`,
           components: [],
         })
       } else if (interaction.customId.startsWith("bet_")) {
@@ -1842,7 +1939,8 @@ client.on("interactionCreate", async (interaction) => {
             for (const winner of closeResult.winners) {
               const profitText =
                 winner.profit >= 0 ? `+${formatNumber(winner.profit)}` : `${formatNumber(winner.profit)}`
-              winnersText += `<@${winner.userId}>: Bet ${formatNumber(winner.betAmount)} → Won ${formatNumber(winner.payout)} (${profitText})\n`
+              winnersText += `<@${winner.userId}>: Bet ${formatNumber(winner.betAmount)} → Won ${formatNumber(winner.payout)} (${profitText})
+`
             }
 
             // Split into multiple fields if too long
@@ -1874,7 +1972,9 @@ client.on("interactionCreate", async (interaction) => {
               const channel = await client.channels.fetch(poolInfo.channelId)
               const message = await channel.messages.fetch(poolInfo.messageId)
               await message.edit({
-                content: `🎲 **${closeResult.poolTitle}** *(POOL CLOSED)*\n\n✅ **Results posted below!**`,
+                content: `🎲 **${closeResult.poolTitle}** *(POOL CLOSED)*
+
+✅ **Results posted below!**`,
                 components: [],
               })
 
@@ -1909,7 +2009,9 @@ client.on("interactionCreate", async (interaction) => {
               const channel = await client.channels.fetch(poolInfo.channelId)
               const poolMessage = await channel.messages.fetch(poolInfo.messageId)
               await poolMessage.edit({
-                content: `🎲 **Pool Cancelled** *(REFUNDED)*\n\nThis pool was cancelled by the creator. All bets have been refunded.`,
+                content: `🎲 **Pool Cancelled** *(REFUNDED)*
+
+This pool was cancelled by the creator. All bets have been refunded.`,
                 components: [],
               })
             } catch (error) {
