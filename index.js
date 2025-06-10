@@ -56,6 +56,16 @@ async function initDatabase() {
   }
 }
 
+// Sample fixed block from '/add' and '/remove' command logic:
+const balanceInfo = new TextInputBuilder()
+  .setCustomId('user_balance_info')
+  .setLabel('User balance')
+  .setStyle(TextInputStyle.Short)
+  .setValue('Select a user to view their balance')
+  .setRequired(false);
+
+// The rest of your code remains the same...
+
 // Database helper functions
 async function getUserPoints(userId) {
   try {
