@@ -66,10 +66,25 @@ async function initDatabase() {
         option_id INTEGER REFERENCES pool_options(id) ON DELETE CASCADE,
         amount INTEGER,
         locked_at TIMESTAMP,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(user_id, pool_id)
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `)
+
+    // Add unique constraint if it doesn't exist
+    try {
+      await pool.query(`
+        ALTER TABLE user_bets 
+        ADD CONSTRAINT user_bets_user_pool_unique 
+        UNIQUE (user_id, pool_id)
+      `)
+      console.log("✅ Added unique constraint to user_bets table")
+    } catch (error) {
+      if (error.code === "42P07") {
+        console.log("✅ Unique constraint already exists")
+      } else {
+        console.error("Error adding unique constraint:", error)
+      }
+    }
 
     console.log("✅ Database initialized successfully")
   } catch (error) {
@@ -175,18 +190,35 @@ async function getUserBet(userId, poolId) {
 
 async function recordBet(userId, poolId, optionId, amount) {
   try {
-    // Use UPSERT to replace existing bet
-    await pool.query(
-      `INSERT INTO user_bets (user_id, pool_id, option_id, amount, locked_at) 
-       VALUES ($1, $2, $3, $4, NULL)
-       ON CONFLICT (user_id, pool_id) 
-       DO UPDATE SET option_id = $3, amount = $4, locked_at = NULL, created_at = CURRENT_TIMESTAMP`,
-      [userId, poolId, optionId, amount],
-    )
+    // Check if user already has a bet on this pool
+    const existingBet = await getUserBet(userId, poolId)
 
-    // Update user points
-    const currentPoints = await getUserPoints(userId)
-    await updateUserPoints(userId, currentPoints - amount)
+    if (existingBet) {
+      // Update existing bet
+      await pool.query(
+        `UPDATE user_bets 
+         SET option_id = $1, amount = $2, locked_at = NULL, created_at = CURRENT_TIMESTAMP 
+         WHERE user_id = $3 AND pool_id = $4`,
+        [optionId, amount, userId, poolId],
+      )
+
+      // Refund previous bet amount and charge new amount
+      const currentPoints = await getUserPoints(userId)
+      const pointsDifference = amount - existingBet.amount
+      await updateUserPoints(userId, currentPoints - pointsDifference)
+    } else {
+      // Insert new bet
+      await pool.query(
+        `INSERT INTO user_bets (user_id, pool_id, option_id, amount, locked_at) 
+         VALUES ($1, $2, $3, $4, NULL)`,
+        [userId, poolId, optionId, amount],
+      )
+
+      // Deduct points for new bet
+      const currentPoints = await getUserPoints(userId)
+      await updateUserPoints(userId, currentPoints - amount)
+    }
+
     return true
   } catch (error) {
     console.error("Error recording bet:", error)
@@ -530,6 +562,74 @@ client.on("interactionCreate", async (interaction) => {
           break
         }
 
+        case "add": {
+          if (!isAdmin(user.id, member)) {
+            await interaction.reply({
+              content: "❌ You must be a server administrator or have specific admin clearance to use this command!",
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
+
+          const modal = new ModalBuilder().setCustomId("add_credits_modal").setTitle("Add Credits")
+
+          const userIdInput = new TextInputBuilder()
+            .setCustomId("target_user_id")
+            .setLabel("User ID")
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder("Enter the Discord User ID")
+            .setRequired(true)
+
+          const creditsInput = new TextInputBuilder()
+            .setCustomId("credits")
+            .setLabel("Credits")
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder("Enter number of points to add (1-999999)")
+            .setRequired(true)
+
+          modal.addComponents(
+            new ActionRowBuilder().addComponents(userIdInput),
+            new ActionRowBuilder().addComponents(creditsInput),
+          )
+
+          await interaction.showModal(modal)
+          break
+        }
+
+        case "remove": {
+          if (!isAdmin(user.id, member)) {
+            await interaction.reply({
+              content: "❌ You must be a server administrator or have specific admin clearance to use this command!",
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
+
+          const modal = new ModalBuilder().setCustomId("remove_credits_modal").setTitle("Remove Credits")
+
+          const userIdInput = new TextInputBuilder()
+            .setCustomId("target_user_id")
+            .setLabel("User ID")
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder("Enter the Discord User ID")
+            .setRequired(true)
+
+          const creditsInput = new TextInputBuilder()
+            .setCustomId("credits")
+            .setLabel("Credits")
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder("Enter number of points to remove (1-999999)")
+            .setRequired(true)
+
+          modal.addComponents(
+            new ActionRowBuilder().addComponents(userIdInput),
+            new ActionRowBuilder().addComponents(creditsInput),
+          )
+
+          await interaction.showModal(modal)
+          break
+        }
+
         case "close": {
           if (!isAdmin(user.id, member)) {
             await interaction.reply({
@@ -712,7 +812,7 @@ client.on("interactionCreate", async (interaction) => {
 
         if (currentPoints < totalCost) {
           await interaction.reply({
-            content: `❌ Insufficient points! You need ${formatNumber(totalCost)} more points.`,
+            content: `❌ Insufficient points! You need ${formatNumber(Math.abs(totalCost))} more points.`,
             flags: MessageFlags.Ephemeral,
           })
           return
@@ -754,6 +854,50 @@ client.on("interactionCreate", async (interaction) => {
             flags: MessageFlags.Ephemeral,
           })
         }
+      } else if (customId === "add_credits_modal" || customId === "remove_credits_modal") {
+        const targetUserId = fields.getTextInputValue("target_user_id")
+        const credits = Number.parseInt(fields.getTextInputValue("credits"))
+
+        if (isNaN(credits) || credits < 1 || credits > 999999) {
+          await interaction.reply({
+            content: "❌ Invalid credits amount! Must be a number between 1 and 999999.",
+            flags: MessageFlags.Ephemeral,
+          })
+          return
+        }
+
+        const currentPoints = await getUserPoints(targetUserId)
+        if (currentPoints === null) {
+          await interaction.reply({
+            content: `❌ User <@${targetUserId}> has not joined yet! They must use /participate first.`,
+            flags: MessageFlags.Ephemeral,
+          })
+          return
+        }
+
+        let newPoints
+        if (customId === "add_credits_modal") {
+          newPoints = currentPoints + credits
+          await updateUserPoints(targetUserId, newPoints)
+          await interaction.reply({
+            content: `✅ Added **${formatNumber(credits)}** points to <@${targetUserId}>!\n💰 New balance: **${formatNumber(newPoints)}** points`,
+            flags: MessageFlags.Ephemeral,
+          })
+        } else if (customId === "remove_credits_modal") {
+          if (currentPoints < credits) {
+            await interaction.reply({
+              content: `❌ User <@${targetUserId}> only has **${formatNumber(currentPoints)}** points! Cannot remove **${formatNumber(credits)}** points.`,
+              flags: MessageFlags.Ephemeral,
+            })
+            return
+          }
+          newPoints = currentPoints - credits
+          await updateUserPoints(targetUserId, newPoints)
+          await interaction.reply({
+            content: `✅ Removed **${formatNumber(credits)}** points from <@${targetUserId}>!\n💰 New balance: **${formatNumber(newPoints)}** points`,
+            flags: MessageFlags.Ephemeral,
+          })
+        }
       }
     } catch (error) {
       console.error("Modal submission error:", error.stack)
@@ -766,11 +910,14 @@ client.on("interactionCreate", async (interaction) => {
     }
   } else if (interaction.isButton()) {
     try {
+      console.log(`Button clicked: ${interaction.customId}`)
       const [action, poolId, optionIndex] = interaction.customId.split("_")
 
       if (action === "bet") {
         const poolIdInt = Number.parseInt(poolId)
         const optionIndexInt = Number.parseInt(optionIndex)
+
+        console.log(`Bet button - Pool ID: ${poolIdInt}, Option Index: ${optionIndexInt}`)
 
         // Check if pool is still active
         const poolResult = await pool.query("SELECT * FROM betting_pools WHERE id = $1 AND status = $2", [
@@ -815,6 +962,8 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         modal.addComponents(new ActionRowBuilder().addComponents(stakeInput))
+
+        console.log(`Showing betting modal for pool ${poolIdInt}, option ${optionIndexInt}`)
         await interaction.showModal(modal)
       } else if (action === "cancel") {
         const poolIdInt = Number.parseInt(poolId)
