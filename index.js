@@ -10,6 +10,10 @@ const pool = new Pool({
 // Initialize database tables
 async function initDatabase() {
   try {
+    // Drop user_points table to reset all user data
+    await pool.query('DROP TABLE IF EXISTS user_points CASCADE');
+    
+    // Recreate user_points table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS user_points (
         user_id VARCHAR(20) PRIMARY KEY,
@@ -100,14 +104,28 @@ async function getUserPoints(userId) {
   try {
     const result = await pool.query('SELECT points FROM user_points WHERE user_id = $1', [userId]);
     if (result.rows.length === 0) {
-      // Create new user with 100 starting points
-      await pool.query('INSERT INTO user_points (user_id, points) VALUES ($1, 100)', [userId]);
-      return 100;
+      return null; // User not registered
     }
     return result.rows[0].points;
   } catch (error) {
     console.error('Error getting user points:', error);
-    return 0;
+    return null;
+  }
+}
+
+async function registerUser(userId) {
+  try {
+    const result = await pool.query(`
+      INSERT INTO user_points (user_id, points) 
+      VALUES ($1, 1000) 
+      ON CONFLICT (user_id) 
+      DO NOTHING 
+      RETURNING points
+    `, [userId]);
+    return result.rows.length > 0; // True if user was registered, false if already exists
+  } catch (error) {
+    console.error('Error registering user:', error);
+    return false;
   }
 }
 
@@ -145,6 +163,12 @@ const commands = [
   new SlashCommandBuilder()
     .setName('daily')
     .setDescription('Claim your daily points bonus'),
+  new SlashCommandBuilder()
+    .setName('participate')
+    .setDescription('Join the bot and receive 1000 starting points'),
+  new SlashCommandBuilder()
+    .setName('wallet')
+    .setDescription('Check your current points balance'),
 ];
 
 // Register slash commands
@@ -182,13 +206,52 @@ client.on('interactionCreate', async interaction => {
     switch (commandName) {
       case 'daily': {
         const currentPoints = await getUserPoints(user.id);
-        const dailyBonus = 50;
+        if (currentPoints === null) {
+          await interaction.reply({
+            content: '❌ You must use `/participate` first to join the bot!',
+            ephemeral: true
+          });
+          break;
+        }
+        const dailyBonus = 100;
         const newPoints = currentPoints + dailyBonus;
         
         await updateUserPoints(user.id, newPoints);
         
         await interaction.reply({
           content: `🎁 **Daily bonus claimed!** You received **${dailyBonus}** points!\n💰 New balance: **${formatNumber(newPoints)}** points`,
+          ephemeral: true
+        });
+        break;
+      }
+      
+      case 'participate': {
+        const isNewUser = await registerUser(user.id);
+        if (isNewUser) {
+          await interaction.reply({
+            content: `✅ **Welcome!** You've joined the bot and received **1000** starting points!`,
+            ephemeral: true
+          });
+        } else {
+          await interaction.reply({
+            content: `❌ You've already joined the bot! Use /wallet to check your balance.`,
+            ephemeral: true
+          });
+        }
+        break;
+      }
+      
+      case 'wallet': {
+        const points = await getUserPoints(user.id);
+        if (points === null) {
+          await interaction.reply({
+            content: `❌ You haven't joined yet! Use /participate to start with 1000 points.`,
+            ephemeral: true
+          });
+          break;
+        }
+        await interaction.reply({
+          content: `💰 **${user.username}**, your current balance is **${formatNumber(points)}** points!`,
           ephemeral: true
         });
         break;
