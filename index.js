@@ -26,16 +26,24 @@ const pool = new Pool({
 // Initialize database tables
 async function initDatabase() {
   try {
+    // Drop existing tables to ensure clean schema
+    await pool.query("DROP TABLE IF EXISTS user_bets CASCADE")
+    await pool.query("DROP TABLE IF EXISTS pool_options CASCADE")
+    await pool.query("DROP TABLE IF EXISTS betting_pools CASCADE")
     await pool.query("DROP TABLE IF EXISTS user_points CASCADE")
+
+    // Create user_points table
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS user_points (
+      CREATE TABLE user_points (
         user_id VARCHAR(20) PRIMARY KEY,
         points INTEGER DEFAULT 100,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `)
+
+    // Create betting_pools table
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS betting_pools (
+      CREATE TABLE betting_pools (
         id SERIAL PRIMARY KEY,
         title VARCHAR(255) NOT NULL,
         description TEXT,
@@ -46,26 +54,31 @@ async function initDatabase() {
         channel_id VARCHAR(20)
       )
     `)
+
+    // Create pool_options table
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS pool_options (
+      CREATE TABLE pool_options (
         id SERIAL PRIMARY KEY,
-        pool_id INTEGER REFERENCES betting_pools(id),
+        pool_id INTEGER REFERENCES betting_pools(id) ON DELETE CASCADE,
         option_text VARCHAR(255),
         emoji VARCHAR(10),
         is_correct BOOLEAN DEFAULT FALSE
       )
     `)
+
+    // Create user_bets table with proper column names
     await pool.query(`
-      CREATE TABLE IF NOT EXISTS user_bets (
+      CREATE TABLE user_bets (
         id SERIAL PRIMARY KEY,
         user_id VARCHAR(20),
-        pool_id INTEGER REFERENCES betting_pools(id),
-        option_id INTEGER REFERENCES pool_options(id),
+        pool_id INTEGER REFERENCES betting_pools(id) ON DELETE CASCADE,
+        option_id INTEGER REFERENCES pool_options(id) ON DELETE CASCADE,
         amount INTEGER,
         locked_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `)
+
     console.log("✅ Database initialized successfully")
   } catch (error) {
     console.error("❌ Database initialization failed:", error)
@@ -189,21 +202,57 @@ async function lockBet(userId, poolId) {
 
 async function closePool(poolId, correctOptionId) {
   try {
+    // Close the pool
     await pool.query("UPDATE betting_pools SET status = $1 WHERE id = $2", ["closed", poolId])
+
+    // Mark the correct option
     await pool.query("UPDATE pool_options SET is_correct = TRUE WHERE id = $1", [correctOptionId])
 
+    // Get all winning bets (with correct column reference)
     const bets = await pool.query(
-      "SELECT user_id, amount FROM user_bets WHERE pool_id = $1 AND option_id = $2 AND locked_at IS NOT NULL",
+      `SELECT ub.user_id, ub.amount 
+       FROM user_bets ub 
+       WHERE ub.pool_id = $1 AND ub.option_id = $2 AND ub.locked_at IS NOT NULL`,
       [poolId, correctOptionId],
     )
 
-    const totalStaked = bets.rows.reduce((sum, bet) => sum + bet.amount, 0)
+    if (bets.rows.length === 0) {
+      console.log(`No winning bets found for pool ${poolId}`)
+      return true
+    }
+
+    // Calculate total amount staked on winning option
+    const totalWinningStake = bets.rows.reduce((sum, bet) => sum + bet.amount, 0)
+
+    // Get total amount staked on all options for this pool
+    const totalPoolStake = await pool.query(
+      `SELECT SUM(ub.amount) as total 
+       FROM user_bets ub 
+       WHERE ub.pool_id = $1 AND ub.locked_at IS NOT NULL`,
+      [poolId],
+    )
+
+    const totalStaked = totalPoolStake.rows[0]?.total || 0
+
+    if (totalStaked === 0) {
+      console.log(`No total stake found for pool ${poolId}`)
+      return true
+    }
+
+    // Distribute winnings (90% payout, 10% house cut)
+    const totalPayout = Math.floor(totalStaked * 0.9)
 
     for (const bet of bets.rows) {
-      const reward = Math.floor((bet.amount / totalStaked) * totalStaked * 0.9) // 90% payout, 10% house cut
+      // Calculate proportional reward
+      const rewardRatio = bet.amount / totalWinningStake
+      const reward = Math.floor(totalPayout * rewardRatio)
+
       const currentPoints = (await getUserPoints(bet.user_id)) || 0
       await updateUserPoints(bet.user_id, currentPoints + reward)
+
+      console.log(`Awarded ${reward} points to user ${bet.user_id}`)
     }
+
     return true
   } catch (error) {
     console.error("Error closing pool:", error)
@@ -237,7 +286,7 @@ function isAdmin(userId, member) {
   const hasAdminPermission = member.permissions.has(PermissionFlagsBits.Administrator)
   const isHardcodedAdmin = adminUserIds.includes(userId)
   console.log(
-    `Admin check for user ${userId}: Administrator permission: ${hasAdminPermission}, Hardcoded admin: ${isHardcodedAdmin}, Result: ${hasAdminPermission || isHardcodedAdmin}`,
+    `Admin check for user ${userId}: Administrator permission: ${hasAdminPermission}, Hardcoded admin: ${hasAdminPermission || isHardcodedAdmin}`,
   )
   return hasAdminPermission || isHardcodedAdmin
 }
