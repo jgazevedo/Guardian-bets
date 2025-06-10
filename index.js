@@ -26,24 +26,17 @@ const pool = new Pool({
 // Initialize database tables
 async function initDatabase() {
   try {
-    // Drop existing tables to ensure clean schema
-    await pool.query("DROP TABLE IF EXISTS user_bets CASCADE")
-    await pool.query("DROP TABLE IF EXISTS pool_options CASCADE")
-    await pool.query("DROP TABLE IF EXISTS betting_pools CASCADE")
-    await pool.query("DROP TABLE IF EXISTS user_points CASCADE")
-
-    // Create user_points table
+    // Don't drop existing tables - just create if they don't exist
     await pool.query(`
-      CREATE TABLE user_points (
+      CREATE TABLE IF NOT EXISTS user_points (
         user_id VARCHAR(20) PRIMARY KEY,
         points INTEGER DEFAULT 100,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `)
 
-    // Create betting_pools table
     await pool.query(`
-      CREATE TABLE betting_pools (
+      CREATE TABLE IF NOT EXISTS betting_pools (
         id SERIAL PRIMARY KEY,
         title VARCHAR(255) NOT NULL,
         description TEXT,
@@ -55,9 +48,8 @@ async function initDatabase() {
       )
     `)
 
-    // Create pool_options table
     await pool.query(`
-      CREATE TABLE pool_options (
+      CREATE TABLE IF NOT EXISTS pool_options (
         id SERIAL PRIMARY KEY,
         pool_id INTEGER REFERENCES betting_pools(id) ON DELETE CASCADE,
         option_text VARCHAR(255),
@@ -66,9 +58,8 @@ async function initDatabase() {
       )
     `)
 
-    // Create user_bets table with proper column names
     await pool.query(`
-      CREATE TABLE user_bets (
+      CREATE TABLE IF NOT EXISTS user_bets (
         id SERIAL PRIMARY KEY,
         user_id VARCHAR(20),
         pool_id INTEGER REFERENCES betting_pools(id) ON DELETE CASCADE,
@@ -610,13 +601,26 @@ client.on("interactionCreate", async (interaction) => {
           flags: MessageFlags.Ephemeral,
         })
       } else if (customId.startsWith("bet_confirm_")) {
-        const [, poolId, optionIndex] = customId.split("_")
+        const parts = customId.split("_")
+        const poolId = Number.parseInt(parts[2]) // Convert to integer
+        const optionIndex = Number.parseInt(parts[3]) // Convert to integer
+
+        console.log(`Bet confirmation - Pool ID: ${poolId}, Option Index: ${optionIndex}`)
+
         const stake = Number.parseInt(fields.getTextInputValue("stake"))
         const userId = interaction.user.id
 
         if (isNaN(stake) || stake < 1 || stake > 999999) {
           await interaction.reply({
             content: "❌ Invalid stake amount! Must be between 1 and 999,999.",
+            flags: MessageFlags.Ephemeral,
+          })
+          return
+        }
+
+        if (isNaN(poolId) || isNaN(optionIndex)) {
+          await interaction.reply({
+            content: "❌ Invalid pool or option selected.",
             flags: MessageFlags.Ephemeral,
           })
           return
@@ -640,7 +644,7 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         const optionsResult = await getPoolOptions(poolId)
-        if (!optionsResult.rows.length || !optionsResult.rows[Number.parseInt(optionIndex)]) {
+        if (!optionsResult.rows.length || !optionsResult.rows[optionIndex]) {
           await interaction.reply({
             content: "❌ Invalid option selected.",
             flags: MessageFlags.Ephemeral,
@@ -648,7 +652,7 @@ client.on("interactionCreate", async (interaction) => {
           return
         }
 
-        const optionId = optionsResult.rows[Number.parseInt(optionIndex)].id
+        const optionId = optionsResult.rows[optionIndex].id
         const success = await recordBet(userId, poolId, optionId, stake)
 
         if (success) {
@@ -666,7 +670,7 @@ client.on("interactionCreate", async (interaction) => {
           )
 
           await interaction.reply({
-            content: `✅ Bet of ${formatNumber(stake)} points placed on "${optionsResult.rows[Number.parseInt(optionIndex)].option_text}"! You have 30 seconds to change it.`,
+            content: `✅ Bet of ${formatNumber(stake)} points placed on "${optionsResult.rows[optionIndex].option_text}"! You have 30 seconds to change it.`,
             flags: MessageFlags.Ephemeral,
           })
         } else {
@@ -690,9 +694,14 @@ client.on("interactionCreate", async (interaction) => {
       const [action, poolId, optionIndex] = interaction.customId.split("_")
 
       if (action === "bet") {
+        const poolIdInt = Number.parseInt(poolId)
+        const optionIndexInt = Number.parseInt(optionIndex)
+
+        console.log(`Button click - Pool ID: ${poolIdInt}, Option Index: ${optionIndexInt}`)
+
         // Check if pool is still active
         const poolResult = await pool.query("SELECT * FROM betting_pools WHERE id = $1 AND status = $2", [
-          poolId,
+          poolIdInt,
           "active",
         ])
 
@@ -714,7 +723,9 @@ client.on("interactionCreate", async (interaction) => {
           return
         }
 
-        const modal = new ModalBuilder().setCustomId(`bet_confirm_${poolId}_${optionIndex}`).setTitle("Place Your Bet")
+        const modal = new ModalBuilder()
+          .setCustomId(`bet_confirm_${poolIdInt}_${optionIndexInt}`)
+          .setTitle("Place Your Bet")
 
         const stakeInput = new TextInputBuilder()
           .setCustomId("stake")
