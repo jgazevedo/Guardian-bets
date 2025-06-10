@@ -589,7 +589,7 @@ const commands = [
         .setName("amount")
         .setDescription("Amount of points to add")
         .setRequired(true)
-        .setMinvalue(1)
+        .setMinValue(1)
         .setMaxValue(999999),
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
@@ -604,7 +604,7 @@ const commands = [
         .setName("amount")
         .setDescription("Amount of points to remove")
         .setRequired(true)
-        .setMinvalue(1)
+        .setMinValue(1)
         .setMaxValue(999999),
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
