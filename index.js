@@ -40,8 +40,6 @@ async function initDatabase() {
       CREATE TABLE IF NOT EXISTS betting_pools (
         id SERIAL PRIMARY KEY,
         title VARCHAR(255) NOT NULL,
-        description TEXT,
-        additional_info TEXT,
         creator_id VARCHAR(20),
         status VARCHAR(20) DEFAULT 'active',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -78,7 +76,7 @@ async function initDatabase() {
         lender_id VARCHAR(20),
         borrower_id VARCHAR(20),
         amount INTEGER,
-        interest_rate DECIMAL(5,2),
+        interest_rate INTEGER,
         days INTEGER,
         status VARCHAR(20) DEFAULT 'pending',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -109,10 +107,28 @@ async function initDatabase() {
   }
 }
 
-// Fix database schema - add missing columns
+// Fix database schema - add missing columns and fix data types
 async function fixDatabase() {
   try {
     console.log("🔄 Starting database fix...")
+
+    // Fix loans table - change interest_rate to INTEGER to avoid overflow
+    try {
+      await pool.query(`ALTER TABLE loans ALTER COLUMN interest_rate TYPE INTEGER`)
+      console.log("✅ Fixed interest_rate column type in loans table")
+    } catch (error) {
+      if (error.code === "42804") {
+        // Column already correct type or has data that needs conversion
+        try {
+          await pool.query(`ALTER TABLE loans ALTER COLUMN interest_rate TYPE INTEGER USING interest_rate::INTEGER`)
+          console.log("✅ Converted interest_rate column to INTEGER")
+        } catch (conversionError) {
+          console.log("✅ interest_rate column type already correct or conversion not needed")
+        }
+      } else {
+        console.error("Error fixing interest_rate column:", error)
+      }
+    }
 
     // Fix loans table - add days column
     try {
@@ -126,18 +142,6 @@ async function fixDatabase() {
         console.log("✅ days column already exists")
       } else {
         console.error("Error adding days column:", error)
-      }
-    }
-
-    // Fix betting_pools table - add additional_info column
-    try {
-      await pool.query(`ALTER TABLE betting_pools ADD COLUMN additional_info TEXT`)
-      console.log("✅ Added additional_info column to betting_pools table")
-    } catch (error) {
-      if (error.code === "42701") {
-        console.log("✅ additional_info column already exists")
-      } else {
-        console.error("Error adding additional_info column:", error)
       }
     }
 
@@ -245,10 +249,13 @@ async function createLoan(lenderId, borrowerId, amount, interestRate, days) {
     const dueDate = new Date()
     dueDate.setDate(dueDate.getDate() + days)
 
+    // Ensure interestRate is an integer to avoid overflow
+    const integerInterestRate = Math.floor(interestRate)
+
     const result = await pool.query(
       `INSERT INTO loans (lender_id, borrower_id, amount, interest_rate, days, due_date) 
        VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-      [lenderId, borrowerId, amount, interestRate, days, dueDate],
+      [lenderId, borrowerId, amount, integerInterestRate, days, dueDate],
     )
     return result.rows[0].id
   } catch (error) {
@@ -377,8 +384,6 @@ async function getUserLoans(userId) {
   }
 }
 
-// Add these new database helper functions after the getUserLoans function
-
 async function clearLoanById(loanId) {
   try {
     const result = await pool.query("DELETE FROM loans WHERE id = $1 RETURNING *", [loanId])
@@ -408,12 +413,12 @@ async function clearLoansByStatus(status) {
   }
 }
 
-async function createPool(creatorId, title, description, additionalInfo, options) {
+async function createPool(creatorId, title, options) {
   try {
-    const result = await pool.query(
-      "INSERT INTO betting_pools (creator_id, title, description, additional_info) VALUES ($1, $2, $3, $4) RETURNING id",
-      [creatorId, title, description || null, additionalInfo || null],
-    )
+    const result = await pool.query("INSERT INTO betting_pools (creator_id, title) VALUES ($1, $2) RETURNING id", [
+      creatorId,
+      title,
+    ])
     const poolId = result.rows[0].id
 
     for (const { text, emoji } of options) {
@@ -432,9 +437,7 @@ async function createPool(creatorId, title, description, additionalInfo, options
 
 async function getOpenPools(creatorId) {
   try {
-    return await pool.query("SELECT id, title, description, additional_info FROM betting_pools WHERE status = $1", [
-      "active",
-    ])
+    return await pool.query("SELECT id, title FROM betting_pools WHERE status = $1", ["active"])
   } catch (error) {
     console.error("Error getting open pools:", error)
     return { rows: [] }
@@ -447,8 +450,6 @@ async function getAllActiveBets() {
       SELECT 
         bp.id as pool_id,
         bp.title,
-        bp.description,
-        bp.additional_info,
         bp.creator_id,
         po.id as option_id,
         po.option_text,
@@ -459,7 +460,7 @@ async function getAllActiveBets() {
       LEFT JOIN pool_options po ON bp.id = po.pool_id
       LEFT JOIN user_bets ub ON po.id = ub.option_id
       WHERE bp.status = 'active'
-      GROUP BY bp.id, bp.title, bp.description, bp.additional_info, bp.creator_id, po.id, po.option_text, po.emoji
+      GROUP BY bp.id, bp.title, bp.creator_id, po.id, po.option_text, po.emoji
       ORDER BY bp.created_at DESC, po.id ASC
     `)
     return result.rows
@@ -604,7 +605,7 @@ async function closePool(poolId, correctOptionId) {
     console.log(`Locked ${lockResult.rows.length} bets before closing pool`)
 
     // Get pool information
-    const poolInfo = await pool.query("SELECT title, description FROM betting_pools WHERE id = $1", [poolId])
+    const poolInfo = await pool.query("SELECT title FROM betting_pools WHERE id = $1", [poolId])
     const poolTitle = poolInfo.rows[0]?.title || "Unknown Pool"
 
     // Close the pool
@@ -667,7 +668,6 @@ async function closePool(poolId, correctOptionId) {
       }
     }
 
-    // NEW IMPROVED CALCULATION: Traditional betting odds
     // Winners split the entire pool proportionally to their winning bets
     for (const bet of winningBets) {
       const winnerShare = bet.amount / totalWinningStake // Their proportion of winning bets
@@ -688,13 +688,23 @@ async function closePool(poolId, correctOptionId) {
       )
     }
 
+    // Create a detailed winners breakdown message
+    let winnersBreakdown = ""
+    winners.forEach((winner, index) => {
+      winnersBreakdown += `<@${winner.userId}>: won ${formatNumber(winner.payout)} points`
+      if (index < winners.length - 1) {
+        winnersBreakdown += ". "
+      }
+    })
+
     return {
       success: true,
       poolTitle,
       correctOption: `${correctOptionName} ${correctOptionEmoji}`,
       totalPool,
       winners,
-      message: `Pool closed successfully! ${winners.length} winner(s) shared the ${formatNumber(totalPool)} point pool.`,
+      winnersBreakdown,
+      message: `Pool closed successfully! ${winners.length} winner(s) shared the ${formatNumber(totalPool)} point pool. ${winnersBreakdown}`,
     }
   } catch (error) {
     console.error("Error closing pool:", error)
@@ -765,7 +775,7 @@ const commands = [
         .setMinValue(10)
         .setMaxValue(999999),
     )
-    .addNumberOption((option) =>
+    .addIntegerOption((option) =>
       option
         .setName("interest")
         .setDescription("Interest rate percentage (e.g., 5 for 5%)")
@@ -1011,8 +1021,6 @@ client.on("interactionCreate", async (interaction) => {
             if (!poolsMap.has(bet.pool_id)) {
               poolsMap.set(bet.pool_id, {
                 title: bet.title,
-                description: bet.description,
-                additional_info: bet.additional_info,
                 creator_id: bet.creator_id,
                 options: [],
                 totalStaked: 0,
@@ -1040,14 +1048,7 @@ client.on("interactionCreate", async (interaction) => {
               optionsText += `${option.emoji || "•"} **${option.text}**: ${option.betCount} bets (${formatNumber(option.totalStaked)} points)\n`
             }
 
-            let fieldValue = ""
-            if (poolData.description) {
-              fieldValue += `*${poolData.description}*\n\n`
-            }
-            if (poolData.additional_info) {
-              fieldValue += `**Additional Info:** ${poolData.additional_info}\n\n`
-            }
-            fieldValue += `**Options:**\n${optionsText}`
+            let fieldValue = `**Options:**\n${optionsText}`
             fieldValue += `\n**Total Pool:** ${formatNumber(poolData.totalStaked)} points`
             fieldValue += `\n**Created by:** <@${poolData.creator_id}>`
 
@@ -1113,7 +1114,7 @@ client.on("interactionCreate", async (interaction) => {
           const lender = user
           const borrower = interaction.options.getUser("user")
           const amount = interaction.options.getInteger("amount")
-          const interest = interaction.options.getNumber("interest")
+          const interest = interaction.options.getInteger("interest")
           const days = interaction.options.getInteger("days")
 
           // Check self-lending FIRST, before any other operations
@@ -1225,20 +1226,6 @@ client.on("interactionCreate", async (interaction) => {
             .setPlaceholder("Enter a title for your betting pool")
             .setRequired(true)
 
-          const descriptionInput = new TextInputBuilder()
-            .setCustomId("pool_description")
-            .setLabel("Description (Optional)")
-            .setStyle(TextInputStyle.Paragraph)
-            .setPlaceholder("Describe what this pool is about")
-            .setRequired(false)
-
-          const additionalInfoInput = new TextInputBuilder()
-            .setCustomId("additional_info")
-            .setLabel("Additional Information (Optional)")
-            .setStyle(TextInputStyle.Paragraph)
-            .setPlaceholder("Any extra details or rules")
-            .setRequired(false)
-
           const option1Input = new TextInputBuilder()
             .setCustomId("option_1")
             .setLabel("Option 1 (text + emoji)")
@@ -1253,12 +1240,26 @@ client.on("interactionCreate", async (interaction) => {
             .setPlaceholder("e.g., No 👎")
             .setRequired(true)
 
+          const option3Input = new TextInputBuilder()
+            .setCustomId("option_3")
+            .setLabel("Option 3 (text + emoji) - Optional")
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder("e.g., Maybe 🤔")
+            .setRequired(false)
+
+          const option4Input = new TextInputBuilder()
+            .setCustomId("option_4")
+            .setLabel("Option 4 (text + emoji) - Optional")
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder("e.g., Never 🚫")
+            .setRequired(false)
+
           modal.addComponents(
             new ActionRowBuilder().addComponents(titleInput),
-            new ActionRowBuilder().addComponents(descriptionInput),
-            new ActionRowBuilder().addComponents(additionalInfoInput),
             new ActionRowBuilder().addComponents(option1Input),
             new ActionRowBuilder().addComponents(option2Input),
+            new ActionRowBuilder().addComponents(option3Input),
+            new ActionRowBuilder().addComponents(option4Input),
           )
 
           await interaction.showModal(modal)
@@ -1267,7 +1268,7 @@ client.on("interactionCreate", async (interaction) => {
 
         case "cancel": {
           const userPools = await pool.query(
-            "SELECT id, title, description FROM betting_pools WHERE creator_id = $1 AND status = 'active'",
+            "SELECT id, title FROM betting_pools WHERE creator_id = $1 AND status = 'active'",
             [user.id],
           )
 
@@ -1286,7 +1287,7 @@ client.on("interactionCreate", async (interaction) => {
               userPools.rows.map((pool) => ({
                 label: pool.title.substring(0, 100),
                 value: pool.id.toString(),
-                description: pool.description ? pool.description.substring(0, 100) : "No description",
+                description: "Click to cancel this pool",
               })),
             )
 
@@ -1392,7 +1393,7 @@ client.on("interactionCreate", async (interaction) => {
               pools.rows.map((pool) => ({
                 label: pool.title.substring(0, 100),
                 value: pool.id.toString(),
-                description: pool.description ? pool.description.substring(0, 100) : "No description",
+                description: "Click to close this pool",
               })),
             )
 
@@ -1469,29 +1470,26 @@ client.on("interactionCreate", async (interaction) => {
 
       if (customId === "create_pool_modal") {
         const title = fields.getTextInputValue("pool_title")
-        let description = null
-        let additionalInfo = null
-
-        try {
-          description = fields.getTextInputValue("pool_description") || null
-        } catch (e) {
-          // Description is optional
-        }
-
-        try {
-          additionalInfo = fields.getTextInputValue("additional_info") || null
-        } catch (e) {
-          // Additional info is optional
-        }
-
         const options = []
 
-        // Process required options
-        for (let i = 1; i <= 2; i++) {
-          const optionText = fields.getTextInputValue(`option_${i}`)
-          if (optionText) {
-            const parsed = parseOptionText(optionText)
-            options.push(parsed)
+        // Process all options (2 required, 2 optional)
+        for (let i = 1; i <= 4; i++) {
+          try {
+            const optionText = fields.getTextInputValue(`option_${i}`)
+            if (optionText && optionText.trim()) {
+              const parsed = parseOptionText(optionText)
+              options.push(parsed)
+            }
+          } catch (error) {
+            // Option is empty or not provided (this is fine for options 3 and 4)
+            if (i <= 2) {
+              // Options 1 and 2 are required
+              await interaction.reply({
+                content: `❌ Option ${i} is required for the betting pool.`,
+                flags: MessageFlags.Ephemeral,
+              })
+              return
+            }
           }
         }
 
@@ -1503,7 +1501,7 @@ client.on("interactionCreate", async (interaction) => {
           return
         }
 
-        const poolId = await createPool(interaction.user.id, title, description, additionalInfo, options)
+        const poolId = await createPool(interaction.user.id, title, options)
         if (!poolId) {
           await interaction.reply({
             content: "❌ Failed to create pool. Please try again.",
@@ -1512,7 +1510,7 @@ client.on("interactionCreate", async (interaction) => {
           return
         }
 
-        // Create betting buttons
+        // Create betting buttons (max 5 per row, so we'll use 4)
         const buttons = options.map((opt, i) => {
           const button = new ButtonBuilder()
             .setCustomId(`bet_${poolId}_${i}`)
@@ -1527,14 +1525,7 @@ client.on("interactionCreate", async (interaction) => {
         const row = new ActionRowBuilder().addComponents(buttons)
 
         // Build pool message content
-        let content = `🎲 **${title}**\n`
-        if (description) {
-          content += `${description}\n`
-        }
-        if (additionalInfo) {
-          content += `\n**Additional Info:** ${additionalInfo}\n`
-        }
-        content += `\n*Created by <@${interaction.user.id}> • Betting closes in 5 minutes*`
+        const content = `🎲 **${title}**\n\n*Created by <@${interaction.user.id}> • Betting closes in 5 minutes*`
 
         // Send the pool message
         const channel = interaction.channel
@@ -1749,69 +1740,36 @@ client.on("interactionCreate", async (interaction) => {
           content: `❌ **Loan Rejected**\n\n${interaction.user} has rejected the loan offer.`,
           components: [],
         })
-      } else {
-        // Handle betting buttons
-        const [action, poolId, optionIndex] = interaction.customId.split("_")
+      } else if (interaction.customId.startsWith("bet_")) {
+        const parts = interaction.customId.split("_")
+        const poolId = Number.parseInt(parts[1])
+        const optionIndex = Number.parseInt(parts[2])
 
-        if (action === "bet") {
-          const poolIdInt = Number.parseInt(poolId)
-          const optionIndexInt = Number.parseInt(optionIndex)
-
-          console.log(`Bet button - Pool ID: ${poolIdInt}, Option Index: ${optionIndexInt}`)
-
-          // Check if pool is still active
-          const poolResult = await pool.query("SELECT * FROM betting_pools WHERE id = $1 AND status = $2", [
-            poolIdInt,
-            "active",
-          ])
-
-          if (!poolResult.rows.length) {
-            await interaction.reply({
-              content: "❌ This pool is closed or does not exist.",
-              flags: MessageFlags.Ephemeral,
-            })
-            return
-          }
-
-          // Check if user is registered
-          const userPoints = await getUserPoints(interaction.user.id)
-          if (userPoints === null) {
-            await interaction.reply({
-              content: "❌ You must use `/participate` first to join the bot!",
-              flags: MessageFlags.Ephemeral,
-            })
-            return
-          }
-
-          // Check if user already has a bet
-          const existingBet = await getUserBet(interaction.user.id, poolIdInt)
-          if (existingBet) {
-            await interaction.reply({
-              content: `❌ You already have a bet on this pool! You bet **${formatNumber(existingBet.amount)}** points on "${existingBet.option_text}". Bets cannot be changed once placed.`,
-              flags: MessageFlags.Ephemeral,
-            })
-            return
-          }
-
-          const modal = new ModalBuilder()
-            .setCustomId(`bet_confirm_${poolIdInt}_${optionIndexInt}`)
-            .setTitle("Place Your Bet")
-
-          const stakeInput = new TextInputBuilder()
-            .setCustomId("stake")
-            .setLabel("Stake Amount")
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder(`Enter points to stake (min: 50, max: ${formatNumber(userPoints)})`)
-            .setRequired(true)
-
-          modal.addComponents(new ActionRowBuilder().addComponents(stakeInput))
-
-          console.log(`Showing betting modal for pool ${poolIdInt}, option ${optionIndexInt}`)
-          await interaction.showModal(modal)
+        // Check if user has existing bet
+        const existingBet = await getUserBet(interaction.user.id, poolId)
+        if (existingBet) {
+          await interaction.reply({
+            content: `❌ You already have a bet on this pool! You bet **${formatNumber(existingBet.amount)}** points on "${existingBet.option_text}". Bets cannot be changed once placed.`,
+            flags: MessageFlags.Ephemeral,
+          })
+          return
         }
+
+        const modal = new ModalBuilder().setCustomId(`bet_confirm_${poolId}_${optionIndex}`).setTitle("Confirm Bet")
+
+        const stakeInput = new TextInputBuilder()
+          .setCustomId("stake")
+          .setLabel("Stake Amount (50-999,999 points)")
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder("Enter the amount of points to bet")
+          .setRequired(true)
+
+        modal.addComponents(new ActionRowBuilder().addComponents(stakeInput))
+
+        await interaction.showModal(modal)
       }
     } catch (error) {
-      console.error("Button interaction error:", error.stack)
+      console.error("Button click error:", error.stack)
       if (!interaction.replied && !interaction.deferred) {
         await interaction.reply({
           content: "❌ An error occurred while processing your request!",
@@ -1821,65 +1779,67 @@ client.on("interactionCreate", async (interaction) => {
     }
   } else if (interaction.isStringSelectMenu()) {
     try {
-      if (interaction.customId === "pool_select") {
-        const poolId = interaction.values[0]
-        const optionsResult = await getPoolOptions(poolId)
+      console.log(`Select menu interaction: ${interaction.customId}`)
 
-        if (!optionsResult.rows.length) {
-          await interaction.update({
-            content: "❌ No options available for this pool.",
-            components: [],
+      if (interaction.customId === "pool_select") {
+        const poolId = Number.parseInt(interaction.values[0])
+
+        const optionsResult = await getPoolOptions(poolId)
+        if (optionsResult.rows.length === 0) {
+          await interaction.reply({
+            content: "❌ No options found for this pool.",
+            flags: MessageFlags.Ephemeral,
           })
           return
         }
 
         const optionSelect = new StringSelectMenuBuilder()
-          .setCustomId(`close_pool_${poolId}`)
-          .setPlaceholder("Select the correct answer")
+          .setCustomId(`correct_option_select_${poolId}`)
+          .setPlaceholder("Select the correct option")
           .addOptions(
-            optionsResult.rows.map((opt, i) => ({
-              label: opt.option_text,
-              value: opt.id.toString(),
-              description: `Option ${i + 1}${opt.emoji ? ` ${opt.emoji}` : ""}`,
-              emoji: opt.emoji || undefined,
+            optionsResult.rows.map((option) => ({
+              label: option.option_text.substring(0, 100),
+              value: option.id.toString(),
+              description: "Click to select this option as the correct answer",
             })),
           )
 
         const row = new ActionRowBuilder().addComponents(optionSelect)
-        await interaction.update({
-          content: "Select the correct answer to close the pool:",
+        await interaction.reply({
+          content: "Select the correct option for this pool:",
           components: [row],
+          flags: MessageFlags.Ephemeral,
         })
-      } else if (interaction.customId.startsWith("close_pool_")) {
-        const poolId = interaction.customId.split("_")[2]
+      } else if (interaction.customId.startsWith("correct_option_select_")) {
+        const poolId = Number.parseInt(interaction.customId.split("_")[3])
         const correctOptionId = Number.parseInt(interaction.values[0])
 
-        const result = await closePool(poolId, correctOptionId)
+        const closeResult = await closePool(poolId, correctOptionId)
 
-        if (result.success) {
+        if (closeResult.success) {
           // Create results embed
           const resultsEmbed = new EmbedBuilder()
-            .setTitle(`🏆 Pool Results: ${result.poolTitle}`)
+            .setTitle(`🏆 Pool Results: ${closeResult.poolTitle}`)
             .setColor(0x00ff00)
             .addFields({
               name: "🎯 Correct Answer",
-              value: result.correctOption,
+              value: closeResult.correctOption,
               inline: true,
             })
             .addFields({
               name: "💰 Total Pool",
-              value: `${formatNumber(result.totalPool)} points`,
+              value: `${formatNumber(closeResult.totalPool)} points`,
               inline: true,
             })
             .addFields({
               name: "👑 Winners",
-              value: result.winners.length > 0 ? `${result.winners.length} winner(s)` : "No winners",
+              value: closeResult.winners.length > 0 ? `${closeResult.winners.length} winner(s)` : "No winners",
               inline: true,
             })
 
-          if (result.winners.length > 0) {
+          if (closeResult.winners.length > 0) {
             let winnersText = ""
-            for (const winner of result.winners) {
+            for (const winner of closeResult.winners) {
               const profitText =
                 winner.profit >= 0 ? `+${formatNumber(winner.profit)}` : `${formatNumber(winner.profit)}`
               winnersText += `<@${winner.userId}>: Bet ${formatNumber(winner.betAmount)} → Won ${formatNumber(winner.payout)} (${profitText})\n`
@@ -1908,13 +1868,13 @@ client.on("interactionCreate", async (interaction) => {
           resultsEmbed.setTimestamp()
 
           // Update the original pool message if possible
-          const poolInfo = activePools.get(Number.parseInt(poolId))
+          const poolInfo = activePools.get(poolId)
           if (poolInfo) {
             try {
               const channel = await client.channels.fetch(poolInfo.channelId)
               const message = await channel.messages.fetch(poolInfo.messageId)
               await message.edit({
-                content: `🎲 **${result.poolTitle}** *(POOL CLOSED)*\n\n✅ **Results posted below!**`,
+                content: `🎲 **${closeResult.poolTitle}** *(POOL CLOSED)*\n\n✅ **Results posted below!**`,
                 components: [],
               })
 
@@ -1923,56 +1883,57 @@ client.on("interactionCreate", async (interaction) => {
             } catch (error) {
               console.error("Error updating pool message:", error)
             }
-            activePools.delete(Number.parseInt(poolId))
+            activePools.delete(poolId)
           }
 
           await interaction.update({
-            content: `✅ ${result.message}`,
+            content: `✅ ${closeResult.message}`,
             components: [],
           })
         } else {
           await interaction.update({
-            content: `❌ ${result.message}`,
+            content: `❌ ${closeResult.message}`,
             components: [],
           })
         }
       } else if (interaction.customId === "cancel_pool_select") {
-        const poolId = interaction.values[0]
-        const result = await cancelPool(poolId, interaction.user.id)
+        const poolId = Number.parseInt(interaction.values[0])
 
-        if (result.success) {
+        const cancelResult = await cancelPool(poolId, interaction.user.id)
+
+        if (cancelResult.success) {
           // Update the original pool message if possible
-          const poolInfo = activePools.get(Number.parseInt(poolId))
+          const poolInfo = activePools.get(poolId)
           if (poolInfo) {
             try {
               const channel = await client.channels.fetch(poolInfo.channelId)
-              const message = await channel.messages.fetch(poolInfo.messageId)
-              await message.edit({
+              const poolMessage = await channel.messages.fetch(poolInfo.messageId)
+              await poolMessage.edit({
                 content: `🎲 **Pool Cancelled** *(REFUNDED)*\n\nThis pool was cancelled by the creator. All bets have been refunded.`,
                 components: [],
               })
             } catch (error) {
               console.error("Error updating cancelled pool message:", error)
             }
-            activePools.delete(Number.parseInt(poolId))
+            activePools.delete(poolId)
           }
 
           await interaction.update({
-            content: `✅ ${result.message}`,
+            content: `✅ ${cancelResult.message}`,
             components: [],
           })
         } else {
           await interaction.update({
-            content: `❌ ${result.message}`,
+            content: `❌ ${cancelResult.message}`,
             components: [],
           })
         }
       }
     } catch (error) {
-      console.error("Select menu error:", error.stack)
+      console.error("Select menu interaction error:", error.stack)
       if (!interaction.replied && !interaction.deferred) {
         await interaction.reply({
-          content: "❌ An error occurred while processing your selection!",
+          content: "❌ An error occurred while processing your request!",
           flags: MessageFlags.Ephemeral,
         })
       }
@@ -1992,4 +1953,3 @@ process.on("SIGINT", async () => {
   client.destroy()
   process.exit(0)
 })
-
