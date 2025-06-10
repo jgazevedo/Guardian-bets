@@ -309,6 +309,37 @@ async function getUserLoans(userId) {
   }
 }
 
+// Add these new database helper functions after the getUserLoans function
+
+async function clearLoanById(loanId) {
+  try {
+    const result = await pool.query("DELETE FROM loans WHERE id = $1 RETURNING *", [loanId])
+    return result.rows.length > 0 ? result.rows[0] : null
+  } catch (error) {
+    console.error("Error clearing loan by ID:", error)
+    return null
+  }
+}
+
+async function clearLoansByStatus(status) {
+  try {
+    let query = "DELETE FROM loans WHERE status = $1 RETURNING *"
+    let params = [status]
+
+    // Special case for self-loans
+    if (status === "self") {
+      query = "DELETE FROM loans WHERE lender_id = borrower_id RETURNING *"
+      params = []
+    }
+
+    const result = await pool.query(query, params)
+    return result.rows
+  } catch (error) {
+    console.error("Error clearing loans by status:", error)
+    return []
+  }
+}
+
 async function createPool(creatorId, title, description, options) {
   try {
     const result = await pool.query(
@@ -613,6 +644,37 @@ const commands = [
     .setName("close")
     .setDescription("Close a betting pool and select the correct answer (Admin or creator only)")
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  new SlashCommandBuilder()
+    .setName("clearloan")
+    .setDescription("Clear loans from the system (Admin only)")
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("id")
+        .setDescription("Clear a specific loan by ID")
+        .addIntegerOption((option) =>
+          option.setName("loan_id").setDescription("The ID of the loan to clear").setRequired(true).setMinValue(1),
+        ),
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName("status")
+        .setDescription("Clear all loans with a specific status")
+        .addStringOption((option) =>
+          option
+            .setName("status")
+            .setDescription("The status of loans to clear")
+            .setRequired(true)
+            .addChoices(
+              { name: "Pending", value: "pending" },
+              { name: "Active", value: "active" },
+              { name: "Collected", value: "collected" },
+              { name: "Paid", value: "paid" },
+              { name: "Rejected", value: "rejected" },
+              { name: "Self-loans", value: "self" },
+            ),
+        ),
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 ]
 
 // Register slash commands
@@ -807,6 +869,7 @@ client.on("interactionCreate", async (interaction) => {
           const interest = interaction.options.getNumber("interest")
           const days = interaction.options.getInteger("days")
 
+          // Check self-lending FIRST, before any other operations
           if (borrower.id === lender.id) {
             await interaction.reply({
               content: "❌ You cannot lend points to yourself!",
@@ -1057,6 +1120,50 @@ client.on("interactionCreate", async (interaction) => {
             components: [row],
             flags: MessageFlags.Ephemeral,
           })
+          break
+        }
+        case "clearloan": {
+          if (!isAdmin(user.id, member)) {
+            await interaction.reply({
+              content: "❌ You must be a server administrator or have specific admin clearance to use this command!",
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
+
+          const subcommand = interaction.options.getSubcommand()
+
+          if (subcommand === "id") {
+            const loanId = interaction.options.getInteger("loan_id")
+            const clearedLoan = await clearLoanById(loanId)
+
+            if (clearedLoan) {
+              await interaction.reply({
+                content: `✅ Successfully cleared loan #${loanId}:\n• Lender: <@${clearedLoan.lender_id}>\n• Borrower: <@${clearedLoan.borrower_id}>\n• Amount: ${formatNumber(clearedLoan.amount)} points\n• Status: ${clearedLoan.status}`,
+                flags: MessageFlags.Ephemeral,
+              })
+            } else {
+              await interaction.reply({
+                content: `❌ No loan found with ID ${loanId}.`,
+                flags: MessageFlags.Ephemeral,
+              })
+            }
+          } else if (subcommand === "status") {
+            const status = interaction.options.getString("status")
+            const clearedLoans = await clearLoansByStatus(status)
+
+            if (clearedLoans.length > 0) {
+              await interaction.reply({
+                content: `✅ Successfully cleared ${clearedLoans.length} loans with status "${status === "self" ? "self-loans" : status}".`,
+                flags: MessageFlags.Ephemeral,
+              })
+            } else {
+              await interaction.reply({
+                content: `ℹ️ No loans found with status "${status === "self" ? "self-loans" : status}".`,
+                flags: MessageFlags.Ephemeral,
+              })
+            }
+          }
           break
         }
 
