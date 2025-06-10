@@ -265,6 +265,13 @@ async function closePool(poolId, correctOptionId) {
   try {
     console.log(`Closing pool ${poolId} with correct option ${correctOptionId}`)
 
+    // First, lock all unlocked bets for this pool
+    const lockResult = await pool.query(
+      "UPDATE user_bets SET locked_at = CURRENT_TIMESTAMP WHERE pool_id = $1 AND locked_at IS NULL RETURNING user_id, amount",
+      [poolId],
+    )
+    console.log(`Locked ${lockResult.rows.length} bets before closing pool`)
+
     // Close the pool
     await pool.query("UPDATE betting_pools SET status = $1 WHERE id = $2", ["closed", poolId])
 
@@ -289,7 +296,7 @@ async function closePool(poolId, correctOptionId) {
 
     // Get winning bets
     const winningBets = allBets.rows.filter((bet) => bet.option_id == correctOptionId)
-    console.log(`Found ${winningBets.rows.length} winning bets`)
+    console.log(`Found ${winningBets.length} winning bets`)
 
     if (winningBets.length === 0) {
       console.log("No winning bets - house keeps all")
@@ -373,10 +380,30 @@ const commands = [
   new SlashCommandBuilder()
     .setName("add")
     .setDescription("Add points to a user (Admin only)")
+    .addUserOption((option) => option.setName("user").setDescription("The user to add points to").setRequired(true))
+    .addIntegerOption((option) =>
+      option
+        .setName("amount")
+        .setDescription("Amount of points to add")
+        .setRequired(true)
+        .setMinValue(1)
+        .setMaxValue(999999),
+    )
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   new SlashCommandBuilder()
     .setName("remove")
     .setDescription("Remove points from a user (Admin only)")
+    .addUserOption((option) =>
+      option.setName("user").setDescription("The user to remove points from").setRequired(true),
+    )
+    .addIntegerOption((option) =>
+      option
+        .setName("amount")
+        .setDescription("Amount of points to remove")
+        .setRequired(true)
+        .setMinValue(1)
+        .setMaxValue(999999),
+    )
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   new SlashCommandBuilder().setName("create").setDescription("Create a new betting pool"),
   new SlashCommandBuilder()
@@ -571,28 +598,25 @@ client.on("interactionCreate", async (interaction) => {
             break
           }
 
-          const modal = new ModalBuilder().setCustomId("add_credits_modal").setTitle("Add Credits")
+          const targetUser = interaction.options.getUser("user")
+          const amount = interaction.options.getInteger("amount")
 
-          const userIdInput = new TextInputBuilder()
-            .setCustomId("target_user_id")
-            .setLabel("User ID")
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder("Enter the Discord User ID")
-            .setRequired(true)
+          const currentPoints = await getUserPoints(targetUser.id)
+          if (currentPoints === null) {
+            await interaction.reply({
+              content: `❌ User ${targetUser} has not joined yet! They must use /participate first.`,
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
 
-          const creditsInput = new TextInputBuilder()
-            .setCustomId("credits")
-            .setLabel("Credits")
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder("Enter number of points to add (1-999999)")
-            .setRequired(true)
+          const newPoints = currentPoints + amount
+          await updateUserPoints(targetUser.id, newPoints)
 
-          modal.addComponents(
-            new ActionRowBuilder().addComponents(userIdInput),
-            new ActionRowBuilder().addComponents(creditsInput),
-          )
-
-          await interaction.showModal(modal)
+          await interaction.reply({
+            content: `✅ Added **${formatNumber(amount)}** points to ${targetUser}!\n💰 New balance: **${formatNumber(newPoints)}** points`,
+            flags: MessageFlags.Ephemeral,
+          })
           break
         }
 
@@ -605,28 +629,33 @@ client.on("interactionCreate", async (interaction) => {
             break
           }
 
-          const modal = new ModalBuilder().setCustomId("remove_credits_modal").setTitle("Remove Credits")
+          const targetUser = interaction.options.getUser("user")
+          const amount = interaction.options.getInteger("amount")
 
-          const userIdInput = new TextInputBuilder()
-            .setCustomId("target_user_id")
-            .setLabel("User ID")
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder("Enter the Discord User ID")
-            .setRequired(true)
+          const currentPoints = await getUserPoints(targetUser.id)
+          if (currentPoints === null) {
+            await interaction.reply({
+              content: `❌ User ${targetUser} has not joined yet! They must use /participate first.`,
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
 
-          const creditsInput = new TextInputBuilder()
-            .setCustomId("credits")
-            .setLabel("Credits")
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder("Enter number of points to remove (1-999999)")
-            .setRequired(true)
+          if (currentPoints < amount) {
+            await interaction.reply({
+              content: `❌ User ${targetUser} only has **${formatNumber(currentPoints)}** points! Cannot remove **${formatNumber(amount)}** points.`,
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
 
-          modal.addComponents(
-            new ActionRowBuilder().addComponents(userIdInput),
-            new ActionRowBuilder().addComponents(creditsInput),
-          )
+          const newPoints = currentPoints - amount
+          await updateUserPoints(targetUser.id, newPoints)
 
-          await interaction.showModal(modal)
+          await interaction.reply({
+            content: `✅ Removed **${formatNumber(amount)}** points from ${targetUser}!\n💰 New balance: **${formatNumber(newPoints)}** points`,
+            flags: MessageFlags.Ephemeral,
+          })
           break
         }
 
@@ -742,7 +771,7 @@ client.on("interactionCreate", async (interaction) => {
         // Send the pool message
         const channel = interaction.channel
         const poolMessage = await channel.send({
-          content: `🎲 **${title}**\n${description}\n\n*Created by <@${interaction.user.id}> • Pool closes in 5 minutes*`,
+          content: `🎲 **${title}**\n${description}\n\n*Created by <@${interaction.user.id}> • Betting closes in 5 minutes*`,
           components: [row],
         })
 
@@ -759,26 +788,32 @@ client.on("interactionCreate", async (interaction) => {
           channelId: channel.id,
         })
 
-        // Set timeout to close pool
+        // Set timeout to lock all bets after 5 minutes (but keep pool open for manual closure)
         setTimeout(
           async () => {
             try {
-              await pool.query("UPDATE betting_pools SET status = $1 WHERE id = $2", ["closed", poolId])
+              // Lock all unlocked bets for this pool
+              const lockResult = await pool.query(
+                "UPDATE user_bets SET locked_at = CURRENT_TIMESTAMP WHERE pool_id = $1 AND locked_at IS NULL RETURNING user_id, amount",
+                [poolId],
+              )
+              console.log(`Auto-locked ${lockResult.rows.length} bets for pool ${poolId} after 5 minutes`)
+
+              // Update the message to show betting is closed but pool is still open
               const message = await channel.messages.fetch(poolMessage.id)
               await message.edit({
-                content: `🎲 **${title}** *(CLOSED)*\n${description}\n\n*Pool has been closed*`,
-                components: [],
+                content: `🎲 **${title}** *(BETTING CLOSED)*\n${description}\n\n*Created by <@${interaction.user.id}> • Betting closed, awaiting manual pool closure*`,
+                components: [], // Remove betting buttons
               })
-              activePools.delete(poolId)
             } catch (error) {
-              console.error("Error auto-closing pool:", error)
+              console.error("Error auto-locking bets:", error)
             }
           },
           5 * 60 * 1000,
         ) // 5 minutes
 
         await interaction.reply({
-          content: `✅ Pool "${title}" created successfully! It will automatically close in 5 minutes.`,
+          content: `✅ Pool "${title}" created successfully! Betting will close in 5 minutes, but the pool will remain open for manual closure.`,
           flags: MessageFlags.Ephemeral,
         })
       } else if (customId.startsWith("bet_confirm_")) {
@@ -808,11 +843,19 @@ client.on("interactionCreate", async (interaction) => {
 
         // Check if user has existing bet
         const existingBet = await getUserBet(userId, poolId)
-        const totalCost = existingBet ? stake - existingBet.amount : stake
+
+        // Calculate the actual cost difference
+        let totalCost
+        if (existingBet) {
+          totalCost = stake - existingBet.amount // Difference between new and old bet
+        } else {
+          totalCost = stake // Full amount for new bet
+        }
 
         if (currentPoints < totalCost) {
+          const needed = totalCost - currentPoints
           await interaction.reply({
-            content: `❌ Insufficient points! You need ${formatNumber(Math.abs(totalCost))} more points.`,
+            content: `❌ Insufficient points! You need **${formatNumber(needed)}** more points.`,
             flags: MessageFlags.Ephemeral,
           })
           return
@@ -851,50 +894,6 @@ client.on("interactionCreate", async (interaction) => {
         } else {
           await interaction.reply({
             content: "❌ Failed to place bet. Please try again.",
-            flags: MessageFlags.Ephemeral,
-          })
-        }
-      } else if (customId === "add_credits_modal" || customId === "remove_credits_modal") {
-        const targetUserId = fields.getTextInputValue("target_user_id")
-        const credits = Number.parseInt(fields.getTextInputValue("credits"))
-
-        if (isNaN(credits) || credits < 1 || credits > 999999) {
-          await interaction.reply({
-            content: "❌ Invalid credits amount! Must be a number between 1 and 999999.",
-            flags: MessageFlags.Ephemeral,
-          })
-          return
-        }
-
-        const currentPoints = await getUserPoints(targetUserId)
-        if (currentPoints === null) {
-          await interaction.reply({
-            content: `❌ User <@${targetUserId}> has not joined yet! They must use /participate first.`,
-            flags: MessageFlags.Ephemeral,
-          })
-          return
-        }
-
-        let newPoints
-        if (customId === "add_credits_modal") {
-          newPoints = currentPoints + credits
-          await updateUserPoints(targetUserId, newPoints)
-          await interaction.reply({
-            content: `✅ Added **${formatNumber(credits)}** points to <@${targetUserId}>!\n💰 New balance: **${formatNumber(newPoints)}** points`,
-            flags: MessageFlags.Ephemeral,
-          })
-        } else if (customId === "remove_credits_modal") {
-          if (currentPoints < credits) {
-            await interaction.reply({
-              content: `❌ User <@${targetUserId}> only has **${formatNumber(currentPoints)}** points! Cannot remove **${formatNumber(credits)}** points.`,
-              flags: MessageFlags.Ephemeral,
-            })
-            return
-          }
-          newPoints = currentPoints - credits
-          await updateUserPoints(targetUserId, newPoints)
-          await interaction.reply({
-            content: `✅ Removed **${formatNumber(credits)}** points from <@${targetUserId}>!\n💰 New balance: **${formatNumber(newPoints)}** points`,
             flags: MessageFlags.Ephemeral,
           })
         }
