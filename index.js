@@ -156,6 +156,7 @@ const adminUserIds = ['121564489043804161'];
 function isAdmin(userId, member) {
   const hasAdminPermission = member.permissions.has(PermissionFlagsBits.Administrator);
   const isHardcodedAdmin = adminUserIds.includes(userId);
+  console.log(`Admin check for user ${userId}: Administrator permission: ${hasAdminPermission}, Hardcoded admin: ${isHardcodedAdmin}, Result: ${hasAdminPermission || isHardcodedAdmin}`);
   return hasAdminPermission || isHardcodedAdmin;
 }
 
@@ -165,7 +166,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers // Needed for user select menu
+    GatewayIntentBits.GuildMembers // Required for user select menu
   ]
 });
 
@@ -281,7 +282,6 @@ client.on('interactionCreate', async interaction => {
         
         case 'add': {
           if (!isAdmin(user.id, member)) {
-            console.log(`Admin check failed for user ${user.id}: Administrator permission: ${member.permissions.has(PermissionFlagsBits.Administrator)}, Hardcoded admin: ${adminUserIds.includes(user.id)}`);
             await interaction.reply({
               content: '❌ You must be a server administrator or have specific admin clearance to use this command!',
               ephemeral: true
@@ -326,7 +326,6 @@ client.on('interactionCreate', async interaction => {
         
         case 'remove': {
           if (!isAdmin(user.id, member)) {
-            console.log(`Admin check failed for user ${user.id}: Administrator permission: ${member.permissions.has(PermissionFlagsBits.Administrator)}, Hardcoded admin: ${adminUserIds.includes(user.id)}`);
             await interaction.reply({
               content: '❌ You must be a server administrator or have specific admin clearance to use this command!',
               ephemeral: true
@@ -376,15 +375,16 @@ client.on('interactionCreate', async interaction => {
           });
       }
     } catch (error) {
-      console.error('Command error:', error);
+      console.error('Command error:', error.stack);
       await interaction.reply({
-        content: '❌ An error occurred while processing your command!',
+        content: '❌ An error occurred while processing your command! Check logs for details.',
         ephemeral: true
       });
     }
   } else if (interaction.isModalSubmit()) {
     try {
       const { customId, fields, components } = interaction;
+      console.log(`Modal submit: ${customId}, Components: ${JSON.stringify(components)}`);
       
       if (customId === 'add_credits_modal' || customId === 'remove_credits_modal') {
         // Extract the selected user ID from the user select menu
@@ -392,6 +392,7 @@ client.on('interactionCreate', async interaction => {
         const selectedUserId = userSelect.data.values ? userSelect.data.values[0] : null;
         
         if (!selectedUserId) {
+          console.log('No user selected in modal');
           await interaction.reply({
             content: '❌ No user selected!',
             ephemeral: true
@@ -399,9 +400,11 @@ client.on('interactionCreate', async interaction => {
           return;
         }
         
+        console.log(`Selected user ID: ${selectedUserId}`);
         const credits = parseInt(fields.getTextInputValue('credits'));
         
         if (isNaN(credits) || credits < 1 || credits > 999999) {
+          console.log(`Invalid credits: ${fields.getTextInputValue('credits')}`);
           await interaction.reply({
             content: '❌ Invalid credits amount! Must be a number between 1 and 999999.',
             ephemeral: true
@@ -411,6 +414,7 @@ client.on('interactionCreate', async interaction => {
         
         const currentPoints = await getUserPoints(selectedUserId);
         if (currentPoints === null) {
+          console.log(`User ${selectedUserId} not registered`);
           await interaction.reply({
             content: `❌ User <@${selectedUserId}> has not joined yet! They must use /participate first.`,
             ephemeral: true
@@ -422,12 +426,14 @@ client.on('interactionCreate', async interaction => {
         if (customId === 'add_credits_modal') {
           newPoints = currentPoints + credits;
           await updateUserPoints(selectedUserId, newPoints);
+          console.log(`Added ${credits} points to ${selectedUserId}, new balance: ${newPoints}`);
           await interaction.reply({
             content: `✅ Added **${formatNumber(credits)}** points to <@${selectedUserId}>!\n💰 New balance: **${formatNumber(newPoints)}** points`,
             ephemeral: true
           });
         } else if (customId === 'remove_credits_modal') {
           if (currentPoints < credits) {
+            console.log(`Insufficient points for ${selectedUserId}: ${currentPoints} < ${credits}`);
             await interaction.reply({
               content: `❌ User <@${selectedUserId}> only has **${formatNumber(currentPoints)}** points! Cannot remove **${formatNumber(credits)}** points.`,
               ephemeral: true
@@ -436,6 +442,7 @@ client.on('interactionCreate', async interaction => {
           }
           newPoints = currentPoints - credits;
           await updateUserPoints(selectedUserId, newPoints);
+          console.log(`Removed ${credits} points from ${selectedUserId}, new balance: ${newPoints}`);
           await interaction.reply({
             content: `✅ Removed **${formatNumber(credits)}** points from <@${selectedUserId}>!\n💰 New balance: **${formatNumber(newPoints)}** points`,
             ephemeral: true
@@ -443,9 +450,9 @@ client.on('interactionCreate', async interaction => {
         }
       }
     } catch (error) {
-      console.error('Modal submission error:', error);
+      console.error('Modal submission error:', error.stack);
       await interaction.reply({
-        content: '❌ An error occurred while processing your request!',
+        content: '❌ An error occurred while processing your request! Check logs for details.',
         ephemeral: true
       });
     }
