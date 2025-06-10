@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes } = require('discord.js');
+const { Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes, PermissionFlagsBits, ModalBuilder, TextInputBuilder, TextInputStyle, UserSelectMenuBuilder, ActionRowBuilder } = require('discord.js');
 const { Pool } = require('pg');
 
 // Database setup
@@ -154,7 +154,8 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers // Needed for user select menu
   ]
 });
 
@@ -169,6 +170,14 @@ const commands = [
   new SlashCommandBuilder()
     .setName('wallet')
     .setDescription('Check your current points balance'),
+  new SlashCommandBuilder()
+    .setName('add')
+    .setDescription('Add points to a user (Admin only)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  new SlashCommandBuilder()
+    .setName('remove')
+    .setDescription('Remove points from a user (Admin only)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 ];
 
 // Register slash commands
@@ -178,7 +187,11 @@ async function registerCommands() {
     
     console.log('🔄 Started refreshing application (/) commands.');
     
-    // Your specific guild ID
+    // Clear global commands to ensure no residual commands remain
+    await rest.put(Routes.applicationCommands(process.env.DISCORD_CLIENT_ID), { body: [] });
+    console.log('✅ Cleared global commands.');
+    
+    // Register guild-specific commands
     await rest.put(
       Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, '979180991836995674'),
       { body: commands }
@@ -198,77 +211,241 @@ client.once('ready', async () => {
 });
 
 client.on('interactionCreate', async interaction => {
-  if (!interaction.isChatInputCommand()) return;
-
-  const { commandName, user } = interaction;
-  
-  try {
-    switch (commandName) {
-      case 'daily': {
-        const currentPoints = await getUserPoints(user.id);
+  if (interaction.isChatInputCommand()) {
+    const { commandName, user } = interaction;
+    
+    try {
+      switch (commandName) {
+        case 'daily': {
+          const currentPoints = await getUserPoints(user.id);
+          if (currentPoints === null) {
+            await interaction.reply({
+              content: '❌ You must use `/participate` first to join the bot!',
+              ephemeral: true
+            });
+            break;
+          }
+          const dailyBonus = 50;
+          const newPoints = currentPoints + dailyBonus;
+          
+          await updateUserPoints(user.id, newPoints);
+          
+          await interaction.reply({
+            content: `🎁 **Daily bonus claimed!** You received **${dailyBonus}** points!\n💰 New balance: **${formatNumber(newPoints)}** points`,
+            ephemeral: true
+          });
+          break;
+        }
+        
+        case 'participate': {
+          const isNewUser = await registerUser(user.id);
+          if (isNewUser) {
+            await interaction.reply({
+              content: `✅ **Welcome!** You've joined the bot and received **1000** starting points!`,
+              ephemeral: true
+            });
+          } else {
+            await interaction.reply({
+              content: `❌ You've already joined the bot! Use /wallet to check your balance.`,
+              ephemeral: true
+            });
+          }
+          break;
+        }
+        
+        case 'wallet': {
+          const points = await getUserPoints(user.id);
+          if (points === null) {
+            await interaction.reply({
+              content: `❌ You haven't joined yet! Use /participate to start with 1000 points.`,
+              ephemeral: true
+            });
+            break;
+          }
+          await interaction.reply({
+            content: `💰 **${user.username}**, your current balance is **${formatNumber(points)}** points!`,
+            ephemeral: true
+          });
+          break;
+        }
+        
+        case 'add': {
+          if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+            await interaction.reply({
+              content: '❌ You must be an admin to use this command!',
+              ephemeral: true
+            });
+            break;
+          }
+          
+          const modal = new ModalBuilder()
+            .setCustomId('add_credits_modal')
+            .setTitle('Add Credits');
+          
+          const userSelect = new UserSelectMenuBuilder()
+            .setCustomId('user_id')
+            .setPlaceholder('Select a user')
+            .setMinValues(1)
+            .setMaxValues(1);
+          
+          const creditsInput = new TextInputBuilder()
+            .setCustomId('credits')
+            .setLabel('Credits')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('Enter number of points to add (1-999999)')
+            .setRequired(true);
+          
+          const balanceInfo = new TextInputBuilder()
+            .setCustomId('user_balance')
+            .setLabel('User balance')
+            .setStyle(TextInputStyle.Short)
+            .setValue('Select a user to view their balance')
+            .setRequired(false)
+            .setCustomId('user_balance_info') // Unique ID to avoid conflicts
+            .setDisabled(true);
+          
+          modal.addComponents(
+            new ActionRowBuilder().addComponents(userSelect),
+            new ActionRowBuilder().addComponents(creditsInput),
+            new ActionRowBuilder().addComponents(balanceInfo)
+          );
+          
+          await interaction.showModal(modal);
+          break;
+        }
+        
+        case 'remove': {
+          if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+            await interaction.reply({
+              content: '❌ You must be an admin to use this command!',
+              ephemeral: true
+            });
+            break;
+          }
+          
+          const modal = new ModalBuilder()
+            .setCustomId('remove_credits_modal')
+            .setTitle('Remove Credits');
+          
+          const userSelect = new UserSelectMenuBuilder()
+            .setCustomId('user_id')
+            .setPlaceholder('Select a user')
+            .setMinValues(1)
+            .setMaxValues(1);
+          
+          const creditsInput = new TextInputBuilder()
+            .setCustomId('credits')
+            .setLabel('Credits')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('Enter number of points to remove (1-999999)')
+            .setRequired(true);
+          
+          const balanceInfo = new TextInputBuilder()
+            .setCustomId('user_balance')
+            .setLabel('User balance')
+            .setStyle(TextInputStyle.Short)
+            .setValue('Select a user to view their balance')
+            .setRequired(false)
+            .setCustomId('user_balance_info') // Unique ID to avoid conflicts
+            .setDisabled(true);
+          
+          modal.addComponents(
+            new ActionRowBuilder().addComponents(userSelect),
+            new ActionRowBuilder().addComponents(creditsInput),
+            new ActionRowBuilder().addComponents(balanceInfo)
+          );
+          
+          await interaction.showModal(modal);
+          break;
+        }
+        
+        default:
+          await interaction.reply({
+            content: '❌ Unknown command!',
+            ephemeral: true
+          });
+      }
+    } catch (error) {
+      console.error('Command error:', error);
+      await interaction.reply({
+        content: '❌ An error occurred while processing your command!',
+        ephemeral: true
+      });
+    }
+  } else if (interaction.isModalSubmit()) {
+    try {
+      if (interaction.customId === 'add_credits_modal') {
+        const userId = interaction.fields.getField('user_id').value;
+        const credits = parseInt(interaction.fields.getField('credits').value);
+        
+        if (isNaN(credits) || credits < 1 || credits > 999999) {
+          await interaction.reply({
+            content: '❌ Invalid credits amount! Must be a number between 1 and 999999.',
+            ephemeral: true
+          });
+          return;
+        }
+        
+        const currentPoints = await getUserPoints(userId);
         if (currentPoints === null) {
           await interaction.reply({
-            content: '❌ You must use `/participate` first to join the bot!',
+            content: `❌ User <@${userId}> has not joined yet! They must use /participate first.`,
             ephemeral: true
           });
-          break;
+          return;
         }
-        const dailyBonus = 100;
-        const newPoints = currentPoints + dailyBonus;
         
-        await updateUserPoints(user.id, newPoints);
+        const newPoints = currentPoints + credits;
+        await updateUserPoints(userId, newPoints);
         
         await interaction.reply({
-          content: `🎁 **Daily bonus claimed!** You received **${dailyBonus}** points!\n💰 New balance: **${formatNumber(newPoints)}** points`,
+          content: `✅ Added **${formatNumber(credits)}** points to <@${userId}>!\n💰 New balance: **${formatNumber(newPoints)}** points`,
           ephemeral: true
         });
-        break;
-      }
-      
-      case 'participate': {
-        const isNewUser = await registerUser(user.id);
-        if (isNewUser) {
+      } else if (interaction.customId === 'remove_credits_modal') {
+        const userId = interaction.fields.getField('user_id').value;
+        const credits = parseInt(interaction.fields.getField('credits').value);
+        
+        if (isNaN(credits) || credits < 1 || credits > 999999) {
           await interaction.reply({
-            content: `✅ **Welcome!** You've joined the bot and received **1000** starting points!`,
+            content: '❌ Invalid credits amount! Must be a number between 1 and 999999.',
             ephemeral: true
           });
-        } else {
-          await interaction.reply({
-            content: `❌ You've already joined the bot! Use /wallet to check your balance.`,
-            ephemeral: true
-          });
+          return;
         }
-        break;
-      }
-      
-      case 'wallet': {
-        const points = await getUserPoints(user.id);
-        if (points === null) {
+        
+        const currentPoints = await getUserPoints(userId);
+        if (currentPoints === null) {
           await interaction.reply({
-            content: `❌ You haven't joined yet! Use /participate to start with 1000 points.`,
+            content: `❌ User <@${userId}> has not joined yet! They must use /participate first.`,
             ephemeral: true
           });
-          break;
+          return;
         }
+        
+        if (currentPoints < credits) {
+          await interaction.reply({
+            content: `❌ User <@${userId}> only has **${formatNumber(currentPoints)}** points! Cannot remove **${formatNumber(credits)}** points.`,
+            ephemeral: true
+          });
+          return;
+        }
+        
+        const newPoints = currentPoints - credits;
+        await updateUserPoints(userId, newPoints);
+        
         await interaction.reply({
-          content: `💰 **${user.username}**, your current balance is **${formatNumber(points)}** points!`,
+          content: `✅ Removed **${formatNumber(credits)}** points from <@${userId}>!\n💰 New balance: **${formatNumber(newPoints)}** points`,
           ephemeral: true
         });
-        break;
       }
-      
-      default:
-        await interaction.reply({
-          content: '❌ Unknown command!',
-          ephemeral: true
-        });
+    } catch (error) {
+      console.error('Modal submission error:', error);
+      await interaction.reply({
+        content: '❌ An error occurred while processing your request!',
+        ephemeral: true
+      });
     }
-  } catch (error) {
-    console.error('Command error:', error);
-    await interaction.reply({
-      content: '❌ An error occurred while processing your command!',
-      ephemeral: true
-    });
   }
 });
 
