@@ -14,6 +14,7 @@ const {
   ButtonStyle,
   ComponentType,
   MessageFlags,
+  EmbedBuilder,
 } = require("discord.js")
 const { Pool } = require("pg")
 
@@ -26,7 +27,6 @@ const pool = new Pool({
 // Initialize database tables
 async function initDatabase() {
   try {
-    // Don't drop existing tables - just create if they don't exist
     await pool.query(`
       CREATE TABLE IF NOT EXISTS user_points (
         user_id VARCHAR(20) PRIMARY KEY,
@@ -66,7 +66,8 @@ async function initDatabase() {
         option_id INTEGER REFERENCES pool_options(id) ON DELETE CASCADE,
         amount INTEGER,
         locked_at TIMESTAMP,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, pool_id)
       )
     `)
 
@@ -91,10 +92,8 @@ async function getUserPoints(userId) {
 async function registerUser(userId) {
   try {
     const result = await pool.query(
-      `
-      INSERT INTO user_points (user_id, points) VALUES ($1, 1000) 
-      ON CONFLICT (user_id) DO NOTHING RETURNING points
-    `,
+      `INSERT INTO user_points (user_id, points) VALUES ($1, 1000) 
+       ON CONFLICT (user_id) DO NOTHING RETURNING points`,
       [userId],
     )
     return result.rows.length > 0
@@ -107,10 +106,8 @@ async function registerUser(userId) {
 async function updateUserPoints(userId, points) {
   try {
     await pool.query(
-      `
-      INSERT INTO user_points (user_id, points) VALUES ($1, $2) 
-      ON CONFLICT (user_id) DO UPDATE SET points = $2
-    `,
+      `INSERT INTO user_points (user_id, points) VALUES ($1, $2) 
+       ON CONFLICT (user_id) DO UPDATE SET points = $2`,
       [userId, points],
     )
     return true
@@ -144,10 +141,7 @@ async function createPool(creatorId, title, description, options) {
 
 async function getOpenPools(creatorId) {
   try {
-    return await pool.query(
-      "SELECT id, title, description FROM betting_pools WHERE status = $1 AND (creator_id = $2 OR EXISTS (SELECT 1 FROM user_points WHERE user_id = $2 AND points > 0))",
-      ["active", creatorId],
-    )
+    return await pool.query("SELECT id, title, description FROM betting_pools WHERE status = $1", ["active"])
   } catch (error) {
     console.error("Error getting open pools:", error)
     return { rows: [] }
@@ -163,12 +157,34 @@ async function getPoolOptions(poolId) {
   }
 }
 
+async function getUserBet(userId, poolId) {
+  try {
+    const result = await pool.query(
+      `SELECT ub.*, po.option_text, po.emoji 
+       FROM user_bets ub 
+       JOIN pool_options po ON ub.option_id = po.id 
+       WHERE ub.user_id = $1 AND ub.pool_id = $2`,
+      [userId, poolId],
+    )
+    return result.rows[0] || null
+  } catch (error) {
+    console.error("Error getting user bet:", error)
+    return null
+  }
+}
+
 async function recordBet(userId, poolId, optionId, amount) {
   try {
+    // Use UPSERT to replace existing bet
     await pool.query(
-      "INSERT INTO user_bets (user_id, pool_id, option_id, amount, locked_at) VALUES ($1, $2, $3, $4, NULL)",
+      `INSERT INTO user_bets (user_id, pool_id, option_id, amount, locked_at) 
+       VALUES ($1, $2, $3, $4, NULL)
+       ON CONFLICT (user_id, pool_id) 
+       DO UPDATE SET option_id = $3, amount = $4, locked_at = NULL, created_at = CURRENT_TIMESTAMP`,
       [userId, poolId, optionId, amount],
     )
+
+    // Update user points
     const currentPoints = await getUserPoints(userId)
     await updateUserPoints(userId, currentPoints - amount)
     return true
@@ -180,68 +196,92 @@ async function recordBet(userId, poolId, optionId, amount) {
 
 async function lockBet(userId, poolId) {
   try {
-    await pool.query(
-      "UPDATE user_bets SET locked_at = CURRENT_TIMESTAMP WHERE user_id = $1 AND pool_id = $2 AND locked_at IS NULL",
+    const result = await pool.query(
+      "UPDATE user_bets SET locked_at = CURRENT_TIMESTAMP WHERE user_id = $1 AND pool_id = $2 AND locked_at IS NULL RETURNING *",
       [userId, poolId],
     )
-    return true
+    console.log(`Locked bet for user ${userId} on pool ${poolId}`)
+    return result.rows.length > 0
   } catch (error) {
     console.error("Error locking bet:", error)
     return false
   }
 }
 
+async function cancelBet(userId, poolId) {
+  try {
+    const result = await pool.query(
+      "DELETE FROM user_bets WHERE user_id = $1 AND pool_id = $2 AND locked_at IS NULL RETURNING amount",
+      [userId, poolId],
+    )
+
+    if (result.rows.length > 0) {
+      // Refund points
+      const refundAmount = result.rows[0].amount
+      const currentPoints = await getUserPoints(userId)
+      await updateUserPoints(userId, currentPoints + refundAmount)
+      return refundAmount
+    }
+    return 0
+  } catch (error) {
+    console.error("Error canceling bet:", error)
+    return 0
+  }
+}
+
 async function closePool(poolId, correctOptionId) {
   try {
+    console.log(`Closing pool ${poolId} with correct option ${correctOptionId}`)
+
     // Close the pool
     await pool.query("UPDATE betting_pools SET status = $1 WHERE id = $2", ["closed", poolId])
 
     // Mark the correct option
     await pool.query("UPDATE pool_options SET is_correct = TRUE WHERE id = $1", [correctOptionId])
 
-    // Get all winning bets (with correct column reference)
-    const bets = await pool.query(
-      `SELECT ub.user_id, ub.amount 
+    // Get all locked bets for this pool
+    const allBets = await pool.query(
+      `SELECT ub.user_id, ub.amount, ub.option_id, po.option_text
        FROM user_bets ub 
-       WHERE ub.pool_id = $1 AND ub.option_id = $2 AND ub.locked_at IS NOT NULL`,
-      [poolId, correctOptionId],
-    )
-
-    if (bets.rows.length === 0) {
-      console.log(`No winning bets found for pool ${poolId}`)
-      return true
-    }
-
-    // Calculate total amount staked on winning option
-    const totalWinningStake = bets.rows.reduce((sum, bet) => sum + bet.amount, 0)
-
-    // Get total amount staked on all options for this pool
-    const totalPoolStake = await pool.query(
-      `SELECT SUM(ub.amount) as total 
-       FROM user_bets ub 
+       JOIN pool_options po ON ub.option_id = po.id
        WHERE ub.pool_id = $1 AND ub.locked_at IS NOT NULL`,
       [poolId],
     )
 
-    const totalStaked = totalPoolStake.rows[0]?.total || 0
+    console.log(`Found ${allBets.rows.length} locked bets for pool ${poolId}`)
 
-    if (totalStaked === 0) {
-      console.log(`No total stake found for pool ${poolId}`)
+    if (allBets.rows.length === 0) {
+      console.log("No locked bets found")
       return true
     }
 
-    // Distribute winnings (90% payout, 10% house cut)
-    const totalPayout = Math.floor(totalStaked * 0.9)
+    // Get winning bets
+    const winningBets = allBets.rows.filter((bet) => bet.option_id == correctOptionId)
+    console.log(`Found ${winningBets.rows.length} winning bets`)
 
-    for (const bet of bets.rows) {
-      // Calculate proportional reward
+    if (winningBets.length === 0) {
+      console.log("No winning bets - house keeps all")
+      return true
+    }
+
+    // Calculate totals
+    const totalStaked = allBets.rows.reduce((sum, bet) => sum + bet.amount, 0)
+    const totalWinningStake = winningBets.reduce((sum, bet) => sum + bet.amount, 0)
+    const totalPayout = Math.floor(totalStaked * 0.9) // 90% payout, 10% house cut
+
+    console.log(`Total staked: ${totalStaked}, Total winning stake: ${totalWinningStake}, Total payout: ${totalPayout}`)
+
+    // Distribute winnings
+    for (const bet of winningBets) {
       const rewardRatio = bet.amount / totalWinningStake
       const reward = Math.floor(totalPayout * rewardRatio)
 
       const currentPoints = (await getUserPoints(bet.user_id)) || 0
       await updateUserPoints(bet.user_id, currentPoints + reward)
 
-      console.log(`Awarded ${reward} points to user ${bet.user_id}`)
+      console.log(
+        `Awarded ${reward} points to user ${bet.user_id} (bet: ${bet.amount}, ratio: ${rewardRatio.toFixed(3)})`,
+      )
     }
 
     return true
@@ -257,7 +297,6 @@ function formatNumber(number) {
 }
 
 function parseOptionText(optionText) {
-  // Extract emoji and text from option input
   const emojiRegex =
     /[\u{1F600}-\u{1F64F}]|[\u{1F300}-\u{1F5FF}]|[\u{1F680}-\u{1F6FF}]|[\u{1F1E0}-\u{1F1FF}]|[\u{2600}-\u{26FF}]|[\u{2700}-\u{27BF}]/gu
   const emojis = optionText.match(emojiRegex)
@@ -276,9 +315,6 @@ const adminUserIds = ["121564489043804161"]
 function isAdmin(userId, member) {
   const hasAdminPermission = member.permissions.has(PermissionFlagsBits.Administrator)
   const isHardcodedAdmin = adminUserIds.includes(userId)
-  console.log(
-    `Admin check for user ${userId}: Administrator permission: ${hasAdminPermission}, Hardcoded admin: ${hasAdminPermission || isHardcodedAdmin}`,
-  )
   return hasAdminPermission || isHardcodedAdmin
 }
 
@@ -301,6 +337,7 @@ const commands = [
   new SlashCommandBuilder().setName("daily").setDescription("Claim your daily points bonus"),
   new SlashCommandBuilder().setName("participate").setDescription("Join the bot and receive 1000 starting points"),
   new SlashCommandBuilder().setName("wallet").setDescription("Check your current points balance"),
+  new SlashCommandBuilder().setName("mybets").setDescription("View your current active bets"),
   new SlashCommandBuilder()
     .setName("add")
     .setDescription("Add points to a user (Admin only)")
@@ -394,6 +431,52 @@ client.on("interactionCreate", async (interaction) => {
             content: `💰 **${user.username}**, your current balance is **${formatNumber(points)}** points!`,
             flags: MessageFlags.Ephemeral,
           })
+          break
+        }
+
+        case "mybets": {
+          const userPoints = await getUserPoints(user.id)
+          if (userPoints === null) {
+            await interaction.reply({
+              content: "❌ You must use `/participate` first to join the bot!",
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
+
+          const activeBets = await pool.query(
+            `SELECT ub.*, bp.title, po.option_text, po.emoji, bp.status
+             FROM user_bets ub
+             JOIN betting_pools bp ON ub.pool_id = bp.id
+             JOIN pool_options po ON ub.option_id = po.id
+             WHERE ub.user_id = $1 AND bp.status = 'active'
+             ORDER BY ub.created_at DESC`,
+            [user.id],
+          )
+
+          if (activeBets.rows.length === 0) {
+            await interaction.reply({
+              content: "📊 You have no active bets right now.",
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
+
+          const embed = new EmbedBuilder()
+            .setTitle("📊 Your Active Bets")
+            .setColor(0x00ae86)
+            .setFooter({ text: `Balance: ${formatNumber(userPoints)} points` })
+
+          for (const bet of activeBets.rows) {
+            const status = bet.locked_at ? "🔒 Locked" : "⏰ Can change (30s)"
+            embed.addFields({
+              name: bet.title,
+              value: `**Bet:** ${formatNumber(bet.amount)} points on "${bet.option_text}" ${bet.emoji || ""}\n**Status:** ${status}`,
+              inline: false,
+            })
+          }
+
+          await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral })
           break
         }
 
@@ -525,8 +608,6 @@ client.on("interactionCreate", async (interaction) => {
           // Option 3 is optional, so ignore if not provided
         }
 
-        console.log("Creating pool with:", { title, description, options })
-
         if (options.length < 2) {
           await interaction.reply({
             content: "❌ Please provide at least 2 options for the betting pool.",
@@ -602,25 +683,15 @@ client.on("interactionCreate", async (interaction) => {
         })
       } else if (customId.startsWith("bet_confirm_")) {
         const parts = customId.split("_")
-        const poolId = Number.parseInt(parts[2]) // Convert to integer
-        const optionIndex = Number.parseInt(parts[3]) // Convert to integer
-
-        console.log(`Bet confirmation - Pool ID: ${poolId}, Option Index: ${optionIndex}`)
+        const poolId = Number.parseInt(parts[2])
+        const optionIndex = Number.parseInt(parts[3])
 
         const stake = Number.parseInt(fields.getTextInputValue("stake"))
         const userId = interaction.user.id
 
-        if (isNaN(stake) || stake < 1 || stake > 999999) {
+        if (isNaN(stake) || stake < 10 || stake > 999999) {
           await interaction.reply({
-            content: "❌ Invalid stake amount! Must be between 1 and 999,999.",
-            flags: MessageFlags.Ephemeral,
-          })
-          return
-        }
-
-        if (isNaN(poolId) || isNaN(optionIndex)) {
-          await interaction.reply({
-            content: "❌ Invalid pool or option selected.",
+            content: "❌ Invalid stake amount! Must be between 10 and 999,999 points.",
             flags: MessageFlags.Ephemeral,
           })
           return
@@ -635,9 +706,13 @@ client.on("interactionCreate", async (interaction) => {
           return
         }
 
-        if (currentPoints < stake) {
+        // Check if user has existing bet
+        const existingBet = await getUserBet(userId, poolId)
+        const totalCost = existingBet ? stake - existingBet.amount : stake
+
+        if (currentPoints < totalCost) {
           await interaction.reply({
-            content: `❌ Insufficient points! You have ${formatNumber(currentPoints)} points but tried to bet ${formatNumber(stake)}.`,
+            content: `❌ Insufficient points! You need ${formatNumber(totalCost)} more points.`,
             flags: MessageFlags.Ephemeral,
           })
           return
@@ -656,21 +731,21 @@ client.on("interactionCreate", async (interaction) => {
         const success = await recordBet(userId, poolId, optionId, stake)
 
         if (success) {
-          // Set timeout to lock bet after 30 seconds
+          // Only set a timeout if one doesn't already exist for this user and pool
           const timeoutKey = `${userId}_${poolId}`
-          if (betTimeouts.has(timeoutKey)) {
-            clearTimeout(betTimeouts.get(timeoutKey))
+          if (!betTimeouts.has(timeoutKey)) {
+            betTimeouts.set(
+              timeoutKey,
+              setTimeout(() => {
+                lockBet(userId, poolId)
+                betTimeouts.delete(timeoutKey)
+              }, 30 * 1000),
+            )
           }
-          betTimeouts.set(
-            timeoutKey,
-            setTimeout(() => {
-              lockBet(userId, poolId)
-              betTimeouts.delete(timeoutKey)
-            }, 30 * 1000),
-          )
 
+          const actionText = existingBet ? "updated" : "placed"
           await interaction.reply({
-            content: `✅ Bet of ${formatNumber(stake)} points placed on "${optionsResult.rows[optionIndex].option_text}"! You have 30 seconds to change it.`,
+            content: `✅ Bet ${actionText}! **${formatNumber(stake)}** points on "${optionsResult.rows[optionIndex].option_text}"!\n⏰ You have 30 seconds to change or cancel this bet.`,
             flags: MessageFlags.Ephemeral,
           })
         } else {
@@ -697,8 +772,6 @@ client.on("interactionCreate", async (interaction) => {
         const poolIdInt = Number.parseInt(poolId)
         const optionIndexInt = Number.parseInt(optionIndex)
 
-        console.log(`Button click - Pool ID: ${poolIdInt}, Option Index: ${optionIndexInt}`)
-
         // Check if pool is still active
         const poolResult = await pool.query("SELECT * FROM betting_pools WHERE id = $1 AND status = $2", [
           poolIdInt,
@@ -723,19 +796,41 @@ client.on("interactionCreate", async (interaction) => {
           return
         }
 
+        // Check existing bet
+        const existingBet = await getUserBet(interaction.user.id, poolIdInt)
+
         const modal = new ModalBuilder()
           .setCustomId(`bet_confirm_${poolIdInt}_${optionIndexInt}`)
-          .setTitle("Place Your Bet")
+          .setTitle(existingBet ? "Update Your Bet" : "Place Your Bet")
 
         const stakeInput = new TextInputBuilder()
           .setCustomId("stake")
           .setLabel("Stake Amount")
           .setStyle(TextInputStyle.Short)
-          .setPlaceholder(`Enter points to stake (1-${formatNumber(userPoints)})`)
+          .setPlaceholder(`Enter points to stake (min: 10, max: ${formatNumber(userPoints)})`)
           .setRequired(true)
+
+        if (existingBet) {
+          stakeInput.setValue(existingBet.amount.toString())
+        }
 
         modal.addComponents(new ActionRowBuilder().addComponents(stakeInput))
         await interaction.showModal(modal)
+      } else if (action === "cancel") {
+        const poolIdInt = Number.parseInt(poolId)
+        const refund = await cancelBet(interaction.user.id, poolIdInt)
+
+        if (refund > 0) {
+          await interaction.reply({
+            content: `✅ Bet cancelled! **${formatNumber(refund)}** points refunded.`,
+            flags: MessageFlags.Ephemeral,
+          })
+        } else {
+          await interaction.reply({
+            content: "❌ No active bet found or bet is already locked.",
+            flags: MessageFlags.Ephemeral,
+          })
+        }
       }
     } catch (error) {
       console.error("Button interaction error:", error.stack)
