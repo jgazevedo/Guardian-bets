@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes, PermissionFlagsBits, ModalBuilder, TextInputBuilder, TextInputStyle, UserSelectMenuBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, MessageFlags } = require('discord.js');
+const { Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes, PermissionFlagsBits, ModalBuilder, TextInputBuilder, TextInputStyle, UserSelectMenuBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, MessageFlags, StringSelectMenuBuilder } = require('discord.js');
 const { Pool } = require('pg');
 
 // Database setup
@@ -55,16 +55,6 @@ async function initDatabase() {
     console.error('❌ Database initialization failed:', error);
   }
 }
-
-// Sample fixed block from '/add' and '/remove' command logic:
-const balanceInfo = new TextInputBuilder()
-  .setCustomId('user_balance_info')
-  .setLabel('User balance')
-  .setStyle(TextInputStyle.Short)
-  .setValue('Select a user to view their balance')
-  .setRequired(false);
-
-// The rest of your code remains the same...
 
 // Database helper functions
 async function getUserPoints(userId) {
@@ -132,7 +122,7 @@ async function getOpenPools(creatorId) {
     );
   } catch (error) {
     console.error('Error getting open pools:', error);
-    return [];
+    return { rows: [] };
   }
 }
 
@@ -141,7 +131,7 @@ async function getPoolOptions(poolId) {
     return await pool.query('SELECT id, option_text, emoji FROM pool_options WHERE pool_id = $1', [poolId]);
   } catch (error) {
     console.error('Error getting pool options:', error);
-    return [];
+    return { rows: [] };
   }
 }
 
@@ -238,10 +228,30 @@ const commands = [
   new SlashCommandBuilder()
     .setName('add')
     .setDescription('Add points to a user (Admin only)')
+    .addUserOption(option =>
+      option.setName('user')
+        .setDescription('User to add points to')
+        .setRequired(true))
+    .addIntegerOption(option =>
+      option.setName('amount')
+        .setDescription('Amount of points to add')
+        .setRequired(true)
+        .setMinValue(1)
+        .setMaxValue(999999))
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   new SlashCommandBuilder()
     .setName('remove')
     .setDescription('Remove points from a user (Admin only)')
+    .addUserOption(option =>
+      option.setName('user')
+        .setDescription('User to remove points from')
+        .setRequired(true))
+    .addIntegerOption(option =>
+      option.setName('amount')
+        .setDescription('Amount of points to remove')
+        .setRequired(true)
+        .setMinValue(1)
+        .setMaxValue(999999))
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   new SlashCommandBuilder()
     .setName('create')
@@ -317,34 +327,19 @@ client.on('interactionCreate', async interaction => {
             await interaction.reply({ content: '❌ You must be a server administrator or have specific admin clearance to use this command!', flags: MessageFlags.Ephemeral });
             break;
           }
-          const modal = new ModalBuilder()
-            .setCustomId('add_credits_modal')
-            .setTitle('Add Credits');
-          const userSelect = new UserSelectMenuBuilder()
-            .setCustomId('user_select')
-            .setPlaceholder('Select a user')
-            .setMinValues(1)
-            .setMaxValues(1);
-          const creditsInput = new TextInputBuilder()
-            .setCustomId('credits')
-            .setLabel('Credits')
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder('Enter number of points to add (1-999999)')
-            .setRequired(true);
-          const balanceInfo = new TextInputBuilder()
-            .setCustomId('user_balance_info')
-            .setLabel('User balance')
-            .setStyle(TextInputStyle.Short)
-            .setValue('Select a user to view their balance')
-            .setRequired(false)
-            .setDisabled(true);
-          modal.addComponents(
-            new ActionRowBuilder().addComponents(userSelect),
-            new ActionRowBuilder().addComponents(creditsInput),
-            new ActionRowBuilder().addComponents(balanceInfo)
-          );
-          console.log('Showing modal for /add:', { customId: modal.customId, components: modal.components });
-          await interaction.showModal(modal);
+          
+          const targetUser = interaction.options.getUser('user');
+          const amount = interaction.options.getInteger('amount');
+          
+          const currentPoints = await getUserPoints(targetUser.id);
+          if (currentPoints === null) {
+            await interaction.reply({ content: `❌ User <@${targetUser.id}> has not joined yet! They must use /participate first.`, flags: MessageFlags.Ephemeral });
+            break;
+          }
+          
+          const newPoints = currentPoints + amount;
+          await updateUserPoints(targetUser.id, newPoints);
+          await interaction.reply({ content: `✅ Added **${formatNumber(amount)}** points to <@${targetUser.id}>!\n💰 New balance: **${formatNumber(newPoints)}** points`, flags: MessageFlags.Ephemeral });
           break;
         }
         case 'remove': {
@@ -352,61 +347,79 @@ client.on('interactionCreate', async interaction => {
             await interaction.reply({ content: '❌ You must be a server administrator or have specific admin clearance to use this command!', flags: MessageFlags.Ephemeral });
             break;
           }
-          const modal = new ModalBuilder()
-            .setCustomId('remove_credits_modal')
-            .setTitle('Remove Credits');
-          const userSelect = new UserSelectMenuBuilder()
-            .setCustomId('user_select')
-            .setPlaceholder('Select a user')
-            .setMinValues(1)
-            .setMaxValues(1);
-          const creditsInput = new TextInputBuilder()
-            .setCustomId('credits')
-            .setLabel('Credits')
-            .setStyle(TextInputStyle.Short)
-            .setPlaceholder('Enter number of points to remove (1-999999)')
-            .setRequired(true);
-          const balanceInfo = new TextInputBuilder()
-            .setCustomId('user_balance_info')
-            .setLabel('User balance')
-            .setStyle(TextInputStyle.Short)
-            .setValue('Select a user to view their balance')
-            .setRequired(false)
-            .setDisabled(true);
-          modal.addComponents(
-            new ActionRowBuilder().addComponents(userSelect),
-            new ActionRowBuilder().addComponents(creditsInput),
-            new ActionRowBuilder().addComponents(balanceInfo)
-          );
-          console.log('Showing modal for /remove:', { customId: modal.customId, components: modal.components });
-          await interaction.showModal(modal);
+          
+          const targetUser = interaction.options.getUser('user');
+          const amount = interaction.options.getInteger('amount');
+          
+          const currentPoints = await getUserPoints(targetUser.id);
+          if (currentPoints === null) {
+            await interaction.reply({ content: `❌ User <@${targetUser.id}> has not joined yet! They must use /participate first.`, flags: MessageFlags.Ephemeral });
+            break;
+          }
+          
+          if (currentPoints < amount) {
+            await interaction.reply({ content: `❌ User <@${targetUser.id}> only has **${formatNumber(currentPoints)}** points! Cannot remove **${formatNumber(amount)}** points.`, flags: MessageFlags.Ephemeral });
+            break;
+          }
+          
+          const newPoints = currentPoints - amount;
+          await updateUserPoints(targetUser.id, newPoints);
+          await interaction.reply({ content: `✅ Removed **${formatNumber(amount)}** points from <@${targetUser.id}>!\n💰 New balance: **${formatNumber(newPoints)}** points`, flags: MessageFlags.Ephemeral });
           break;
         }
         case 'create': {
           const modal = new ModalBuilder()
             .setCustomId('create_pool_modal')
             .setTitle('Create Betting Pool');
+          
+          const titleInput = new TextInputBuilder()
+            .setCustomId('pool_title')
+            .setLabel('Pool Title')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('Enter a title for your betting pool')
+            .setRequired(true)
+            .setMaxLength(100);
+          
           const descriptionInput = new TextInputBuilder()
             .setCustomId('pool_description')
             .setLabel('Description')
             .setStyle(TextInputStyle.Paragraph)
-            .setRequired(true);
-          const optionInputs = [];
-          for (let i = 1; i <= 3; i++) {
-            optionInputs.push(
-              new TextInputBuilder()
-                .setCustomId(`option_${i}`)
-                .setLabel(`Option ${i} (text + emoji)`)
-                .setStyle(TextInputStyle.Short)
-                .setPlaceholder('e.g., Yes 👍')
-                .setRequired(true)
-            );
-          }
+            .setPlaceholder('What are people betting on?')
+            .setRequired(true)
+            .setMaxLength(500);
+          
+          const option1Input = new TextInputBuilder()
+            .setCustomId('option_1')
+            .setLabel('Option 1')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g., Yes')
+            .setRequired(true)
+            .setMaxLength(80);
+          
+          const option2Input = new TextInputBuilder()
+            .setCustomId('option_2')
+            .setLabel('Option 2')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g., No')
+            .setRequired(true)
+            .setMaxLength(80);
+          
+          const option3Input = new TextInputBuilder()
+            .setCustomId('option_3')
+            .setLabel('Option 3 (Optional)')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('e.g., Maybe')
+            .setRequired(false)
+            .setMaxLength(80);
+          
           modal.addComponents(
+            new ActionRowBuilder().addComponents(titleInput),
             new ActionRowBuilder().addComponents(descriptionInput),
-            ...optionInputs.map(input => new ActionRowBuilder().addComponents(input))
+            new ActionRowBuilder().addComponents(option1Input),
+            new ActionRowBuilder().addComponents(option2Input),
+            new ActionRowBuilder().addComponents(option3Input)
           );
-          console.log('Showing modal for /create:', { customId: modal.customId, components: modal.components });
+          
           await interaction.showModal(modal);
           break;
         }
@@ -420,18 +433,17 @@ client.on('interactionCreate', async interaction => {
             await interaction.reply({ content: '❌ No open pools available to close.', flags: MessageFlags.Ephemeral });
             break;
           }
-          const poolSelect = new UserSelectMenuBuilder()
+          
+          const poolSelect = new StringSelectMenuBuilder()
             .setCustomId('pool_select')
             .setPlaceholder('Select a pool to close')
-            .setMinValues(1)
-            .setMaxValues(1)
             .addOptions(pools.rows.map(pool => ({
-              label: pool.title,
+              label: pool.title.substring(0, 100),
               value: pool.id.toString(),
-              description: pool.description.substring(0, 50)
+              description: pool.description.substring(0, 100)
             })));
+          
           const row = new ActionRowBuilder().addComponents(poolSelect);
-          console.log('Showing pool select for /close:', { customId: 'pool_select', components: [row] });
           await interaction.reply({ content: 'Select a pool to close:', components: [row], flags: MessageFlags.Ephemeral });
           break;
         }
@@ -440,122 +452,98 @@ client.on('interactionCreate', async interaction => {
       }
     } catch (error) {
       console.error('Command error:', error.stack);
-      await interaction.reply({ content: '❌ An error occurred while processing your command! Check logs for details.', flags: MessageFlags.Ephemeral });
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: '❌ An error occurred while processing your command! Check logs for details.', flags: MessageFlags.Ephemeral });
+      }
     }
   } else if (interaction.isModalSubmit()) {
     try {
-      const { customId, fields, components } = interaction;
-      console.log(`Modal submit: ${customId}, Fields: ${JSON.stringify(fields.fields)}, Components: ${JSON.stringify(components)}`);
-      if (customId === 'add_credits_modal' || customId === 'remove_credits_modal') {
-        const userSelectComponent = components.find(row => row.components.some(comp => comp.customId === 'user_select'));
-        const userSelect = userSelectComponent?.components.find(comp => comp.customId === 'user_select');
-        const selectedUserId = userSelect?.data?.values ? userSelect.data.values[0] : null;
-        console.log(`User select component: ${JSON.stringify(userSelectComponent)}, Selected user ID: ${selectedUserId}`);
-        if (!selectedUserId) {
-          console.log('No user selected in modal, Components:', JSON.stringify(components));
-          await interaction.reply({ content: '❌ No user selected! Please select a user and try again.', flags: MessageFlags.Ephemeral });
-          return;
-        }
-        const credits = parseInt(fields.getTextInputValue('credits'));
-        if (isNaN(credits) || credits < 1 || credits > 999999) {
-          console.log(`Invalid credits: ${fields.getTextInputValue('credits')}`);
-          await interaction.reply({ content: '❌ Invalid credits amount! Must be a number between 1 and 999999.', flags: MessageFlags.Ephemeral });
-          return;
-        }
-        const currentPoints = await getUserPoints(selectedUserId);
-        if (currentPoints === null) {
-          console.log(`User ${selectedUserId} not registered`);
-          await interaction.reply({ content: `❌ User <@${selectedUserId}> has not joined yet! They must use /participate first.`, flags: MessageFlags.Ephemeral });
-          return;
-        }
-        let newPoints;
-        if (customId === 'add_credits_modal') {
-          newPoints = currentPoints + credits;
-          await updateUserPoints(selectedUserId, newPoints);
-          console.log(`Added ${credits} points to ${selectedUserId}, new balance: ${newPoints}`);
-          await interaction.reply({ content: `✅ Added **${formatNumber(credits)}** points to <@${selectedUserId}>!\n💰 New balance: **${formatNumber(newPoints)}** points`, flags: MessageFlags.Ephemeral });
-        } else if (customId === 'remove_credits_modal') {
-          if (currentPoints < credits) {
-            console.log(`Insufficient points for ${selectedUserId}: ${currentPoints} < ${credits}`);
-            await interaction.reply({ content: `❌ User <@${selectedUserId}> only has **${formatNumber(currentPoints)}** points! Cannot remove **${formatNumber(credits)}** points.`, flags: MessageFlags.Ephemeral });
-            return;
-          }
-          newPoints = currentPoints - credits;
-          await updateUserPoints(selectedUserId, newPoints);
-          console.log(`Removed ${credits} points from ${selectedUserId}, new balance: ${newPoints}`);
-          await interaction.reply({ content: `✅ Removed **${formatNumber(credits)}** points from <@${selectedUserId}>!\n💰 New balance: **${formatNumber(newPoints)}** points`, flags: MessageFlags.Ephemeral });
-        }
-      } else if (customId === 'create_pool_modal') {
+      const { customId, fields } = interaction;
+      console.log(`Modal submit: ${customId}`);
+      
+      if (customId === 'create_pool_modal') {
+        const title = fields.getTextInputValue('pool_title');
         const description = fields.getTextInputValue('pool_description');
-        const options = [];
-        for (let i = 1; i <= 3; i++) {
-          const optionText = fields.getTextInputValue(`option_${i}`);
-          if (optionText) {
-            const emojiMatch = optionText.match(/[\uD800-\uDBFF][\uDC00-\uDFFF]/);
-            options.push({ text: optionText.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/, '').trim() || `Option ${i}`, emoji: emojiMatch ? emojiMatch[0] : null });
-          }
+        const option1 = fields.getTextInputValue('option_1');
+        const option2 = fields.getTextInputValue('option_2');
+        const option3 = fields.getTextInputValue('option_3') || null;
+        
+        const options = [
+          { text: option1, emoji: null },
+          { text: option2, emoji: null }
+        ];
+        
+        if (option3) {
+          options.push({ text: option3, emoji: null });
         }
-        console.log('Creating pool with:', { description, options });
-        if (options.length < 3 || !description) {
-          await interaction.reply({ content: '❌ Please fill all fields with at least 3 options and a description.', flags: MessageFlags.Ephemeral });
-          return;
-        }
-        const poolId = await createPool(interaction.user.id, `Pool by ${interaction.user.username}`, description, options);
+        
+        console.log('Creating pool with:', { title, description, options });
+        
+        const poolId = await createPool(interaction.user.id, title, description, options);
         if (!poolId) {
           await interaction.reply({ content: '❌ Failed to create pool.', flags: MessageFlags.Ephemeral });
           return;
         }
+        
         const channel = interaction.channel;
+        const buttons = options.map((opt, i) => 
+          new ButtonBuilder()
+            .setCustomId(`bet_${poolId}_${i}`)
+            .setLabel(opt.text)
+            .setStyle(ButtonStyle.Primary)
+        );
+        
         const poolMessage = await channel.send({
-          content: `**New Pool: ${description}**\n(Created by <@${interaction.user.id}>, closes in 3 minutes)`,
-          components: [new ActionRowBuilder().addComponents(options.map((opt, i) => {
-            const button = new ButtonBuilder()
-              .setCustomId(`bet_${poolId}_${i}`)
-              .setLabel(opt.text)
-              .setStyle(ButtonStyle.Primary);
-            if (opt.emoji) button.setEmoji(opt.emoji); // Only set emoji if it exists
-            return button;
-          }))]
+          content: `**${title}**\n${description}\n\n*Created by <@${interaction.user.id}> • Pool closes in 5 minutes*`,
+          components: [new ActionRowBuilder().addComponents(buttons)]
         });
+        
         await pool.query('UPDATE betting_pools SET message_id = $1, channel_id = $2 WHERE id = $3', [poolMessage.id, channel.id, poolId]);
         activePools.set(poolId, { messageId: poolMessage.id, channelId: channel.id });
+        
+        // Auto-close after 5 minutes
         setTimeout(async () => {
-          await pool.query('UPDATE betting_pools SET status = $1 WHERE id = $2', ['closed', poolId]);
-          const message = await channel.messages.fetch(poolMessage.id);
-          await message.edit({ components: [] });
-          activePools.delete(poolId);
-        }, 3 * 60 * 1000);
-        await interaction.reply({ content: `✅ Pool created! It will close in 3 minutes.`, flags: MessageFlags.Ephemeral });
+          try {
+            await pool.query('UPDATE betting_pools SET status = $1 WHERE id = $2', ['closed', poolId]);
+            const message = await channel.messages.fetch(poolMessage.id);
+            await message.edit({ 
+              content: `**${title}** *(CLOSED)*\n${description}\n\n*This pool has been closed.*`,
+              components: [] 
+            });
+            activePools.delete(poolId);
+          } catch (error) {
+            console.error('Error auto-closing pool:', error);
+          }
+        }, 5 * 60 * 1000);
+        
+        await interaction.reply({ content: `✅ Pool "${title}" created! It will close automatically in 5 minutes.`, flags: MessageFlags.Ephemeral });
       } else if (customId.startsWith('bet_confirm_')) {
-        const [action, poolId, optionIndex] = customId.split('_');
+        const [, poolId, optionIndex] = customId.split('_');
         const stake = parseInt(fields.getTextInputValue('stake'));
         const userId = interaction.user.id;
         const currentPoints = await getUserPoints(userId);
+        
         if (isNaN(stake) || stake < 1 || stake > 999999 || (currentPoints !== null && currentPoints < stake)) {
           await interaction.reply({ content: '❌ Invalid stake amount or insufficient points!', flags: MessageFlags.Ephemeral });
           return;
         }
+        
         const optionsResult = await getPoolOptions(poolId);
         if (!optionsResult.rows.length) {
           await interaction.reply({ content: '❌ No options available for this pool.', flags: MessageFlags.Ephemeral });
           return;
         }
+        
         const optionId = optionsResult.rows[parseInt(optionIndex)].id;
         await recordBet(userId, poolId, optionId, stake);
         betTimeouts.set(`${userId}_${poolId}`, setTimeout(() => lockBet(userId, poolId), 30 * 1000));
         await interaction.reply({ content: `✅ Bet of ${formatNumber(stake)} points placed! You have 30 seconds to change it.`, flags: MessageFlags.Ephemeral });
-      } else if (customId.startsWith('close_confirm_')) {
-        const poolId = customId.split('_')[2];
-        const correctOptionId = fields.getTextInputValue('option_select');
-        if (await closePool(poolId, correctOptionId)) {
-          await interaction.update({ content: `✅ Pool ${poolId} closed. Points distributed!`, components: [], flags: MessageFlags.Ephemeral });
-        } else {
-          await interaction.update({ content: '❌ Failed to close pool.', components: [], flags: MessageFlags.Ephemeral });
-        }
       }
     } catch (error) {
       console.error('Modal submission error:', error.stack);
-      await interaction.reply({ content: '❌ An error occurred while processing your request! Check logs for details.', flags: MessageFlags.Ephemeral });
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: '❌ An error occurred while processing your request! Check logs for details.', flags: MessageFlags.Ephemeral });
+      }
     }
   } else if (interaction.isButton()) {
     try {
@@ -566,22 +554,26 @@ client.on('interactionCreate', async interaction => {
           await interaction.reply({ content: '❌ This pool is closed or does not exist.', flags: MessageFlags.Ephemeral });
           return;
         }
+        
         const modal = new ModalBuilder()
           .setCustomId(`bet_confirm_${poolId}_${optionIndex}`)
           .setTitle('Place Your Bet');
+        
         const stakeInput = new TextInputBuilder()
           .setCustomId('stake')
           .setLabel('Stake Amount')
           .setStyle(TextInputStyle.Short)
           .setPlaceholder('Enter points to stake (1-999999)')
           .setRequired(true);
+        
         modal.addComponents(new ActionRowBuilder().addComponents(stakeInput));
-        console.log('Showing bet modal:', { customId: modal.customId, components: modal.components });
         await interaction.showModal(modal);
       }
     } catch (error) {
       console.error('Button interaction error:', error.stack);
-      await interaction.reply({ content: '❌ An error occurred while processing your bet!', flags: MessageFlags.Ephemeral });
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: '❌ An error occurred while processing your bet!', flags: MessageFlags.Ephemeral });
+      }
     }
   } else if (interaction.isStringSelectMenu()) {
     try {
@@ -589,29 +581,36 @@ client.on('interactionCreate', async interaction => {
         const poolId = interaction.values[0];
         const optionsResult = await getPoolOptions(poolId);
         if (!optionsResult.rows.length) {
-          await interaction.update({ content: '❌ No options available for this pool.', components: [], flags: MessageFlags.Ephemeral });
+          await interaction.update({ content: '❌ No options available for this pool.', components: [] });
           return;
         }
-        const modal = new ModalBuilder()
-          .setCustomId(`close_confirm_${poolId}`)
-          .setTitle('Select Correct Answer');
-        const optionSelect = new UserSelectMenuBuilder()
-          .setCustomId('option_select')
-          .setPlaceholder('Select the correct option')
-          .setMinValues(1)
-          .setMaxValues(1)
+        
+        const optionSelect = new StringSelectMenuBuilder()
+          .setCustomId(`close_pool_${poolId}`)
+          .setPlaceholder('Select the correct answer')
           .addOptions(optionsResult.rows.map((opt, i) => ({
             label: opt.option_text,
             value: opt.id.toString(),
             description: `Option ${i + 1}`
           })));
+        
         const row = new ActionRowBuilder().addComponents(optionSelect);
-        console.log('Showing option select for /close:', { customId: 'option_select', components: [row] });
-        await interaction.update({ content: 'Select the correct answer:', components: [row], flags: MessageFlags.Ephemeral });
+        await interaction.update({ content: 'Select the correct answer:', components: [row] });
+      } else if (interaction.customId.startsWith('close_pool_')) {
+        const poolId = interaction.customId.split('_')[2];
+        const correctOptionId = interaction.values[0];
+        
+        if (await closePool(poolId, correctOptionId)) {
+          await interaction.update({ content: `✅ Pool ${poolId} closed successfully! Points have been distributed to winners.`, components: [] });
+        } else {
+          await interaction.update({ content: '❌ Failed to close pool.', components: [] });
+        }
       }
     } catch (error) {
       console.error('Select menu error:', error.stack);
-      await interaction.reply({ content: '❌ An error occurred while processing your selection!', flags: MessageFlags.Ephemeral });
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: '❌ An error occurred while processing your selection!', flags: MessageFlags.Ephemeral });
+      }
     }
   }
 });
