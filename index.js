@@ -306,9 +306,11 @@ async function closePool(poolId, correctOptionId) {
     // Calculate totals
     const totalStaked = allBets.rows.reduce((sum, bet) => sum + bet.amount, 0)
     const totalWinningStake = winningBets.reduce((sum, bet) => sum + bet.amount, 0)
-    const totalPayout = Math.floor(totalStaked * 0.9) // 90% payout, 10% house cut
+    const totalPayout = totalStaked // Changed from Math.floor(totalStaked * 0.9) to totalStaked for 100% payout
 
-    console.log(`Total staked: ${totalStaked}, Total winning stake: ${totalWinningStake}, Total payout: ${totalPayout}`)
+    console.log(
+      `Total staked: ${totalStaked}, Total winning stake: ${totalWinningStake}, Total payout: ${totalPayout} (100% payout)`,
+    )
 
     // Distribute winnings
     for (const bet of winningBets) {
@@ -874,17 +876,21 @@ client.on("interactionCreate", async (interaction) => {
         const success = await recordBet(userId, poolId, optionId, stake)
 
         if (success) {
-          // Only set a timeout if one doesn't already exist for this user and pool
+          // Clear any existing timeout for this user and pool
           const timeoutKey = `${userId}_${poolId}`
-          if (!betTimeouts.has(timeoutKey)) {
-            betTimeouts.set(
-              timeoutKey,
-              setTimeout(() => {
-                lockBet(userId, poolId)
-                betTimeouts.delete(timeoutKey)
-              }, 30 * 1000),
-            )
+          if (betTimeouts.has(timeoutKey)) {
+            clearTimeout(betTimeouts.get(timeoutKey))
           }
+
+          // Set new timeout to lock bet after 30 seconds
+          betTimeouts.set(
+            timeoutKey,
+            setTimeout(() => {
+              lockBet(userId, poolId)
+              betTimeouts.delete(timeoutKey)
+              console.log(`Auto-locked bet for user ${userId} on pool ${poolId} after 30 seconds`)
+            }, 30 * 1000),
+          )
 
           const actionText = existingBet ? "updated" : "placed"
           await interaction.reply({
@@ -1078,3 +1084,4 @@ process.on("SIGINT", async () => {
   client.destroy()
   process.exit(0)
 })
+
