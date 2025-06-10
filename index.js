@@ -251,7 +251,7 @@ async function registerCommands() {
     console.log('✅ Cleared global commands.');
     await rest.put(
       Routes.applicationGuildCommands(process.env.DISCORD_CLIENT_ID, '979180991836995674'),
-      { body: components }
+      { body: commands }
     );
     console.log('✅ Successfully reloaded guild-specific commands (instant update).');
   } catch (error) {
@@ -414,12 +414,12 @@ client.on('interactionCreate', async interaction => {
             .setCustomId('pool_select')
             .setPlaceholder('Select a pool to close')
             .setMinValues(1)
-            .setMaxValues(1);
-          poolSelect.addOptions(pools.rows.map(pool => ({
-            label: pool.title,
-            value: pool.id.toString(),
-            description: pool.description.substring(0, 50)
-          })));
+            .setMaxValues(1)
+            .addOptions(pools.rows.map(pool => ({
+              label: pool.title,
+              value: pool.id.toString(),
+              description: pool.description.substring(0, 50)
+            })));
           const row = new ActionRowBuilder().addComponents(poolSelect);
           console.log('Showing pool select for /close:', { customId: 'pool_select', components: [row] });
           await interaction.reply({ content: 'Select a pool to close:', components: [row], flags: MessageFlags.Ephemeral });
@@ -525,11 +525,23 @@ client.on('interactionCreate', async interaction => {
           await interaction.reply({ content: '❌ Invalid stake amount or insufficient points!', flags: MessageFlags.Ephemeral });
           return;
         }
-        const options = await getPoolOptions(poolId);
-        const optionId = options.rows[optionIndex].id;
+        const optionsResult = await getPoolOptions(poolId);
+        if (!optionsResult.rows.length) {
+          await interaction.reply({ content: '❌ No options available for this pool.', flags: MessageFlags.Ephemeral });
+          return;
+        }
+        const optionId = optionsResult.rows[parseInt(optionIndex)].id;
         await recordBet(userId, poolId, optionId, stake);
         betTimeouts.set(`${userId}_${poolId}`, setTimeout(() => lockBet(userId, poolId), 30 * 1000));
         await interaction.reply({ content: `✅ Bet of ${formatNumber(stake)} points placed! You have 30 seconds to change it.`, flags: MessageFlags.Ephemeral });
+      } else if (customId.startsWith('close_confirm_')) {
+        const poolId = customId.split('_')[2];
+        const correctOptionId = fields.getTextInputValue('option_select');
+        if (await closePool(poolId, correctOptionId)) {
+          await interaction.update({ content: `✅ Pool ${poolId} closed. Points distributed!`, components: [], flags: MessageFlags.Ephemeral });
+        } else {
+          await interaction.update({ content: '❌ Failed to close pool.', components: [], flags: MessageFlags.Ephemeral });
+        }
       }
     } catch (error) {
       console.error('Modal submission error:', error.stack);
@@ -539,8 +551,8 @@ client.on('interactionCreate', async interaction => {
     try {
       const [action, poolId, optionIndex] = interaction.customId.split('_');
       if (action === 'bet') {
-        const pool = await pool.query('SELECT * FROM betting_pools WHERE id = $1 AND status = $2', [poolId, 'active']);
-        if (!pool.rows.length) {
+        const poolResult = await pool.query('SELECT * FROM betting_pools WHERE id = $1 AND status = $2', [poolId, 'active']);
+        if (!poolResult.rows.length) {
           await interaction.reply({ content: '❌ This pool is closed or does not exist.', flags: MessageFlags.Ephemeral });
           return;
         }
@@ -565,6 +577,11 @@ client.on('interactionCreate', async interaction => {
     try {
       if (interaction.customId === 'pool_select') {
         const poolId = interaction.values[0];
+        const optionsResult = await getPoolOptions(poolId);
+        if (!optionsResult.rows.length) {
+          await interaction.update({ content: '❌ No options available for this pool.', components: [], flags: MessageFlags.Ephemeral });
+          return;
+        }
         const modal = new ModalBuilder()
           .setCustomId(`close_confirm_${poolId}`)
           .setTitle('Select Correct Answer');
@@ -572,24 +589,15 @@ client.on('interactionCreate', async interaction => {
           .setCustomId('option_select')
           .setPlaceholder('Select the correct option')
           .setMinValues(1)
-          .setMaxValues(1);
-        const options = (await getPoolOptions(poolId)).rows;
-        optionSelect.addOptions(options.map((opt, i) => ({
-          label: opt.option_text,
-          value: opt.id.toString(),
-          description: `Option ${i + 1}`
-        })));
+          .setMaxValues(1)
+          .addOptions(optionsResult.rows.map((opt, i) => ({
+            label: opt.option_text,
+            value: opt.id.toString(),
+            description: `Option ${i + 1}`
+          })));
         const row = new ActionRowBuilder().addComponents(optionSelect);
         console.log('Showing option select for /close:', { customId: 'option_select', components: [row] });
         await interaction.update({ content: 'Select the correct answer:', components: [row], flags: MessageFlags.Ephemeral });
-      } else if (interaction.customId.startsWith('close_confirm_')) {
-        const poolId = interaction.customId.split('_')[2];
-        const correctOptionId = interaction.values[0];
-        if (await closePool(poolId, correctOptionId)) {
-          await interaction.update({ content: `✅ Pool ${poolId} closed. Points distributed!`, components: [], flags: MessageFlags.Ephemeral });
-        } else {
-          await interaction.update({ content: '❌ Failed to close pool.', components: [], flags: MessageFlags.Ephemeral });
-        }
       }
     } catch (error) {
       console.error('Select menu error:', error.stack);
