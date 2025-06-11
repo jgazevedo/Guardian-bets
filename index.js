@@ -351,11 +351,12 @@ async function acceptLoan(loanId) {
 }
 
 async function collectLoan(loanId) {
+  let loan
   try {
     const result = await pool.query("SELECT * FROM loans WHERE id = $1 AND status = 'active'", [loanId])
 
     if (result.rows.length > 0) {
-      const loan = result.rows[0]
+      loan = result.rows[0]
       const totalOwed = Math.floor(loan.amount * (1 + loan.interest_rate / 100))
 
       const borrowerPoints = await getUserPoints(loan.borrower_id)
@@ -376,6 +377,89 @@ async function collectLoan(loanId) {
     }
   } catch (error) {
     console.error("Error collecting loan:", error)
+  }
+
+  // Add notification to both lender and borrower after auto-collection
+  try {
+    const lenderUser = await client.users.fetch(loan.lender_id)
+    const borrowerUser = await client.users.fetch(loan.borrower_id)
+    const result = await pool.query("SELECT * FROM loans WHERE id = $1", [loanId])
+    loan = result.rows[0]
+    const totalOwed = Math.floor(loan.amount * (1 + loan.interest_rate / 100))
+    const borrowerPoints = await getUserPoints(loan.borrower_id)
+    const lenderPoints = await getUserPoints(loan.lender_id)
+
+    if (borrowerPoints >= totalOwed) {
+      // Successful collection - notify lender
+      try {
+        await lenderUser.send(`💰 **Loan Auto-Collected!**
+
+Your loan has been automatically collected!
+
+**Loan Details:**
+• Borrower: ${borrowerUser.username}
+• Original amount: ${formatNumber(loan.amount)} points
+• Interest rate: ${loan.interest_rate}%
+• Total collected: ${formatNumber(totalOwed)} points
+• Profit: ${formatNumber(totalOwed - loan.amount)} points
+
+Your points have been automatically added to your balance! 🎉`)
+      } catch (error) {
+        console.error("Error sending lender auto-collection notification:", error)
+      }
+
+      // Notify borrower
+      try {
+        await borrowerUser.send(`📋 **Loan Auto-Collected**
+
+Your loan has been automatically collected as it reached the due date.
+
+**Loan Details:**
+• Lender: ${lenderUser.username}
+• Amount collected: ${formatNumber(totalOwed)} points
+• Your remaining balance: ${formatNumber(borrowerPoints - totalOwed)} points
+
+The loan has been marked as collected. ✅`)
+      } catch (error) {
+        console.error("Error sending borrower auto-collection notification:", error)
+      }
+    } else {
+      // Defaulted loan - notify both parties
+      try {
+        await lenderUser.send(`⚠️ **Loan Defaulted**
+
+Unfortunately, your loan has defaulted as the borrower couldn't repay the full amount.
+
+**Loan Details:**
+• Borrower: ${borrowerUser.username}
+• Original loan: ${formatNumber(loan.amount)} points
+• Amount owed: ${formatNumber(totalOwed)} points
+• Amount recovered: ${formatNumber(borrowerPoints)} points
+• Loss: ${formatNumber(totalOwed - borrowerPoints)} points
+
+We've recovered what we could from their balance. 😔`)
+      } catch (error) {
+        console.error("Error sending lender default notification:", error)
+      }
+
+      try {
+        await borrowerUser.send(`❌ **Loan Defaulted**
+
+Your loan has defaulted as you couldn't repay the full amount by the due date.
+
+**Loan Details:**
+• Lender: ${lenderUser.username}
+• Amount owed: ${formatNumber(totalOwed)} points
+• Your balance taken: ${formatNumber(borrowerPoints)} points
+• Your new balance: 0 points
+
+Your account balance has been cleared to pay what you could. 💸`)
+      } catch (error) {
+        console.error("Error sending borrower default notification:", error)
+      }
+    }
+  } catch (error) {
+    console.error("Error sending auto-collection notifications:", error)
   }
 }
 
@@ -1301,9 +1385,39 @@ Do you accept this loan?`,
           }
 
           if (result.type === "full") {
+            // Send notification to lender
+            try {
+              const lenderUser = await client.users.fetch(loan.lender_id)
+              const totalOwed = Math.floor(loan.amount * (1 + loan.interest_rate / 100))
+
+              // Try to send DM first
+              try {
+                await lenderUser.send(`💰 **Loan Repaid!**
+
+${user.username} has repaid their loan to you!
+
+**Loan Details:**
+• Original amount: ${formatNumber(loan.amount)} points
+• Interest rate: ${loan.interest_rate}%
+• Total repaid: ${formatNumber(result.amount)} points
+• Profit: ${formatNumber(result.amount - loan.amount)} points
+
+Your points have been automatically added to your balance! 🎉`)
+              } catch (dmError) {
+                // If DM fails, notify in the channel
+                await interaction.followUp({
+                  content: `📢 <@${loan.lender_id}> Your loan of ${formatNumber(loan.amount)} points has been repaid by ${user.username}! Total received: ${formatNumber(result.amount)} points.`,
+                  flags: MessageFlags.Ephemeral,
+                })
+              }
+            } catch (error) {
+              console.error("Error sending lender notification:", error)
+            }
+
             await interaction.reply({
               content: `✅ Loan paid in full! **${formatNumber(result.amount)}** points deducted from your balance.
-💰 Loan from ${lender.username} for ${formatNumber(amount)} points has been repaid.`,
+💰 Loan from ${lender.username} for ${formatNumber(amount)} points has been repaid.
+📬 ${lender.username} has been notified of the repayment.`,
               flags: MessageFlags.Ephemeral,
             })
           } else if (result.type === "insufficient") {
@@ -2119,4 +2233,3 @@ process.on("SIGINT", async () => {
   client.destroy()
   process.exit(0)
 })
-
