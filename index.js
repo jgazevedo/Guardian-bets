@@ -2178,7 +2178,7 @@ ${interaction.user} has rejected the loan offer.`,
         const closeResult = await closePool(poolId, correctOptionId)
 
         if (closeResult.success) {
-          // Create results embed
+          // Create results embed - THIS IS THE CARD FROM YOUR PREVIOUS VERSION!
           const resultsEmbed = new EmbedBuilder()
             .setTitle(`🏆 Pool Results: ${closeResult.poolTitle}`)
             .setColor(0x00ff00)
@@ -2203,8 +2203,7 @@ ${interaction.user} has rejected the loan offer.`,
             for (const winner of closeResult.winners) {
               const profitText =
                 winner.profit >= 0 ? `+${formatNumber(winner.profit)}` : `${formatNumber(winner.profit)}`
-              winnersText += `<@${winner.userId}>: Bet ${formatNumber(winner.betAmount)} → Won ${formatNumber(winner.payout)} (${profitText})
-`
+              winnersText += `<@${winner.userId}>: Bet ${formatNumber(winner.betAmount)} → Won ${formatNumber(winner.payout)} (${profitText})\n`
             }
 
             // Split into multiple fields if too long
@@ -2242,7 +2241,7 @@ ${interaction.user} has rejected the loan offer.`,
                 components: [],
               })
 
-              // Post results in the same channel
+              // Post results in the same channel - THIS IS THE CARD YOU WANTED!
               await channel.send({ embeds: [resultsEmbed] })
             } catch (error) {
               console.error("Error updating pool message:", error)
@@ -2319,4 +2318,3 @@ process.on("SIGINT", async () => {
   client.destroy()
   process.exit(0)
 })
-
