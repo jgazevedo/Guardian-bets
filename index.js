@@ -964,8 +964,7 @@ const commands = [
   new SlashCommandBuilder().setName("create").setDescription("Create a new betting pool"),
   new SlashCommandBuilder()
     .setName("close")
-    .setDescription("Close a betting pool and select the correct answer (Admin or creator only)")
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+    .setDescription("Close a betting pool and select the correct answer (Admin or creator only)"),
   new SlashCommandBuilder().setName("cancel").setDescription("Cancel a betting pool you created (refunds all bets)"),
   new SlashCommandBuilder()
     .setName("clearloan")
@@ -2320,3 +2319,4 @@ process.on("SIGINT", async () => {
   client.destroy()
   process.exit(0)
 })
+
