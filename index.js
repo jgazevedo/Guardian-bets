@@ -89,17 +89,18 @@ async function initDatabase() {
     // Add unique constraint if it doesn't exist
     try {
       await pool.query(`
-    DO $$ 
-    BEGIN
-        IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints 
-                       WHERE constraint_name = 'user_bets_user_pool_unique') THEN
-            ALTER TABLE user_bets ADD CONSTRAINT user_bets_user_pool_unique UNIQUE (user_id, pool_id);
-            RAISE NOTICE 'Added unique constraint to user_bets table';
-        ELSE
-            RAISE NOTICE 'Unique constraint already exists';
-        END IF;
-    END $$;
-  `)
+DO $$ 
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints 
+                   WHERE constraint_name = 'user_bets_user_pool_unique' 
+                   AND table_name = 'user_bets') THEN
+        ALTER TABLE user_bets ADD CONSTRAINT user_bets_user_pool_unique UNIQUE (user_id, pool_id);
+        RAISE NOTICE 'Added unique constraint to user_bets table';
+    ELSE
+        RAISE NOTICE 'Unique constraint already exists';
+    END IF;
+END $$;
+`)
       console.log("✅ Unique constraint handled successfully")
     } catch (error) {
       console.error("Error handling unique constraint:", error)
@@ -840,8 +841,13 @@ const commands = [
   new SlashCommandBuilder()
     .setName("pay")
     .setDescription("Pay back a loan early")
+    .addUserOption((option) => option.setName("lender").setDescription("The user you borrowed from").setRequired(true))
     .addIntegerOption((option) =>
-      option.setName("loan_id").setDescription("The ID of the loan to pay back").setRequired(true).setMinValue(1),
+      option
+        .setName("amount")
+        .setDescription("Original loan amount (to identify the loan)")
+        .setRequired(true)
+        .setMinValue(1),
     ),
   new SlashCommandBuilder()
     .setName("add")
@@ -880,32 +886,35 @@ const commands = [
   new SlashCommandBuilder()
     .setName("clearloan")
     .setDescription("Clear loans from the system (Admin only)")
-    .addSubcommand((subcommand) =>
-      subcommand
-        .setName("id")
-        .setDescription("Clear a specific loan by ID")
-        .addIntegerOption((option) =>
-          option.setName("loan_id").setDescription("The ID of the loan to clear").setRequired(true).setMinValue(1),
+    .addStringOption((option) =>
+      option
+        .setName("filter")
+        .setDescription("What loans to clear")
+        .setRequired(true)
+        .addChoices(
+          { name: "All Loans", value: "all" },
+          { name: "By Status", value: "status" },
+          { name: "By User", value: "user" },
+          { name: "My Loans", value: "my" },
+          { name: "Self-Loans", value: "self" },
         ),
     )
-    .addSubcommand((subcommand) =>
-      subcommand
+    .addStringOption((option) =>
+      option
         .setName("status")
-        .setDescription("Clear all loans with a specific status")
-        .addStringOption((option) =>
-          option
-            .setName("status")
-            .setDescription("The status of loans to clear")
-            .setRequired(true)
-            .addChoices(
-              { name: "Pending", value: "pending" },
-              { name: "Active", value: "active" },
-              { name: "Collected", value: "collected" },
-              { name: "Paid", value: "paid" },
-              { name: "Rejected", value: "rejected" },
-              { name: "Self-loans", value: "self" },
-            ),
+        .setDescription("Status filter (required if filter = 'By Status')")
+        .setRequired(false)
+        .addChoices(
+          { name: "Pending", value: "pending" },
+          { name: "Active", value: "active" },
+          { name: "Collected", value: "collected" },
+          { name: "Paid", value: "paid" },
+          { name: "Rejected", value: "rejected" },
+          { name: "Defaulted", value: "defaulted" },
         ),
+    )
+    .addUserOption((option) =>
+      option.setName("user").setDescription("User filter (required if filter = 'By User')").setRequired(false),
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 ]
@@ -933,6 +942,19 @@ client.once("ready", async () => {
   await fixDatabase() // This will fix your database schema
   await registerCommands()
 })
+
+async function findLoanByUserAndAmount(borrowerId, lenderId, amount) {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM loans WHERE borrower_id = $1 AND lender_id = $2 AND amount = $3 AND status = 'active' ORDER BY created_at DESC LIMIT 1",
+      [borrowerId, lenderId, amount],
+    )
+    return result.rows[0] || null
+  } catch (error) {
+    console.error("Error finding loan by user and amount:", error)
+    return null
+  }
+}
 
 client.on("interactionCreate", async (interaction) => {
   if (interaction.isChatInputCommand()) {
@@ -1247,7 +1269,8 @@ Do you accept this loan?`,
         }
 
         case "pay": {
-          const loanId = interaction.options.getInteger("loan_id")
+          const lender = interaction.options.getUser("lender")
+          const amount = interaction.options.getInteger("amount")
           const userPoints = await getUserPoints(user.id)
 
           if (userPoints === null) {
@@ -1258,7 +1281,17 @@ Do you accept this loan?`,
             break
           }
 
-          const result = await payLoan(user.id, loanId, userPoints)
+          // Find the loan by lender and amount
+          const loan = await findLoanByUserAndAmount(user.id, lender.id, amount)
+          if (!loan) {
+            await interaction.reply({
+              content: `❌ No active loan found from ${lender.username} for ${formatNumber(amount)} points!`,
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
+
+          const result = await payLoan(user.id, loan.id, userPoints)
           if (!result) {
             await interaction.reply({
               content: "❌ Loan not found or already paid!",
@@ -1269,7 +1302,8 @@ Do you accept this loan?`,
 
           if (result.type === "full") {
             await interaction.reply({
-              content: `✅ Loan paid in full! **${formatNumber(result.amount)}** points deducted from your balance.`,
+              content: `✅ Loan paid in full! **${formatNumber(result.amount)}** points deducted from your balance.
+💰 Loan from ${lender.username} for ${formatNumber(amount)} points has been repaid.`,
               flags: MessageFlags.Ephemeral,
             })
           } else if (result.type === "insufficient") {
@@ -1482,42 +1516,80 @@ Do you accept this loan?`,
             break
           }
 
-          const subcommand = interaction.options.getSubcommand()
+          const filter = interaction.options.getString("filter")
+          const status = interaction.options.getString("status")
+          const targetUser = interaction.options.getUser("user")
 
-          if (subcommand === "id") {
-            const loanId = interaction.options.getInteger("loan_id")
-            const clearedLoan = await clearLoanById(loanId)
+          let clearedLoans = []
+          let description = ""
 
-            if (clearedLoan) {
-              await interaction.reply({
-                content: `✅ Successfully cleared loan #${loanId}:
-• Lender: <@${clearedLoan.lender_id}>
-• Borrower: <@${clearedLoan.borrower_id}>
-• Amount: ${formatNumber(clearedLoan.amount)} points
-• Status: ${clearedLoan.status}`,
-                flags: MessageFlags.Ephemeral,
-              })
-            } else {
-              await interaction.reply({
-                content: `❌ No loan found with ID ${loanId}.`,
-                flags: MessageFlags.Ephemeral,
-              })
-            }
-          } else if (subcommand === "status") {
-            const status = interaction.options.getString("status")
-            const clearedLoans = await clearLoansByStatus(status)
+          switch (filter) {
+            case "all":
+              clearedLoans = await pool.query("DELETE FROM loans RETURNING *")
+              clearedLoans = clearedLoans.rows
+              description = "all loans"
+              break
 
-            if (clearedLoans.length > 0) {
+            case "status":
+              if (!status) {
+                await interaction.reply({
+                  content: "❌ Status is required when using 'By Status' filter!",
+                  flags: MessageFlags.Ephemeral,
+                })
+                return
+              }
+              clearedLoans = await clearLoansByStatus(status)
+              description = `loans with status "${status}"`
+              break
+
+            case "user":
+              if (!targetUser) {
+                await interaction.reply({
+                  content: "❌ User is required when using 'By User' filter!",
+                  flags: MessageFlags.Ephemeral,
+                })
+                return
+              }
+              const userResult = await pool.query(
+                "DELETE FROM loans WHERE lender_id = $1 OR borrower_id = $1 RETURNING *",
+                [targetUser.id],
+              )
+              clearedLoans = userResult.rows
+              description = `loans involving ${targetUser.username}`
+              break
+
+            case "my":
+              const myResult = await pool.query(
+                "DELETE FROM loans WHERE lender_id = $1 OR borrower_id = $1 RETURNING *",
+                [user.id],
+              )
+              clearedLoans = myResult.rows
+              description = "your loans"
+              break
+
+            case "self":
+              clearedLoans = await clearLoansByStatus("self")
+              description = "self-loans"
+              break
+
+            default:
               await interaction.reply({
-                content: `✅ Successfully cleared ${clearedLoans.length} loans with status "${status === "self" ? "self-loans" : status}".`,
+                content: "❌ Invalid filter option!",
                 flags: MessageFlags.Ephemeral,
               })
-            } else {
-              await interaction.reply({
-                content: `ℹ️ No loans found with status "${status === "self" ? "self-loans" : status}".`,
-                flags: MessageFlags.Ephemeral,
-              })
-            }
+              return
+          }
+
+          if (clearedLoans.length > 0) {
+            await interaction.reply({
+              content: `✅ Successfully cleared ${clearedLoans.length} ${description}.`,
+              flags: MessageFlags.Ephemeral,
+            })
+          } else {
+            await interaction.reply({
+              content: `ℹ️ No ${description} found to clear.`,
+              flags: MessageFlags.Ephemeral,
+            })
           }
           break
         }
@@ -2047,3 +2119,4 @@ process.on("SIGINT", async () => {
   client.destroy()
   process.exit(0)
 })
+
