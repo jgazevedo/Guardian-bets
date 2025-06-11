@@ -1001,6 +1001,18 @@ const commands = [
       option.setName("user").setDescription("User filter (required if filter = 'By User')").setRequired(false),
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  new SlashCommandBuilder()
+    .setName("give")
+    .setDescription("Give points to another user")
+    .addUserOption((option) => option.setName("user").setDescription("The user to give points to").setRequired(true))
+    .addIntegerOption((option) =>
+      option
+        .setName("amount")
+        .setDescription("Amount of points to give")
+        .setRequired(true)
+        .setMinValue(1)
+        .setMaxValue(999999),
+    ),
 ]
 
 // Register slash commands
@@ -1587,17 +1599,22 @@ Your points have been automatically added to your balance! 🎉`)
         }
 
         case "close": {
-          if (!isAdmin(user.id, member)) {
-            await interaction.reply({
-              content: "❌ You must be a server administrator or the pool creator to use this command!",
-              flags: MessageFlags.Ephemeral,
-            })
+          // Get all pools - both admin pools and pools created by this user
+          const pools = await pool.query("SELECT id, title, creator_id FROM betting_pools WHERE status = 'active'", [])
+
+          if (pools.rows.length === 0) {
+            await interaction.reply({ content: "❌ No open pools available to close.", flags: MessageFlags.Ephemeral })
             break
           }
 
-          const pools = await getOpenPools(user.id)
-          if (pools.rows.length === 0) {
-            await interaction.reply({ content: "❌ No open pools available to close.", flags: MessageFlags.Ephemeral })
+          // Filter pools that this user can close (admin can close any, creator can close their own)
+          const userPools = pools.rows.filter((pool) => isAdmin(user.id, member) || pool.creator_id === user.id)
+
+          if (userPools.length === 0) {
+            await interaction.reply({
+              content: "❌ You don't have permission to close any active pools.",
+              flags: MessageFlags.Ephemeral,
+            })
             break
           }
 
@@ -1605,7 +1622,7 @@ Your points have been automatically added to your balance! 🎉`)
             .setCustomId("pool_select")
             .setPlaceholder("Select a pool to close")
             .addOptions(
-              pools.rows.map((pool) => ({
+              userPools.map((pool) => ({
                 label: pool.title.substring(0, 100),
                 value: pool.id.toString(),
                 description: "Click to close this pool",
@@ -1703,6 +1720,76 @@ Your points have been automatically added to your balance! 🎉`)
             await interaction.reply({
               content: `ℹ️ No ${description} found to clear.`,
               flags: MessageFlags.Ephemeral,
+            })
+          }
+          break
+        }
+
+        case "give": {
+          const giver = user
+          const receiver = interaction.options.getUser("user")
+          const amount = interaction.options.getInteger("amount")
+
+          // Check if giving to self
+          if (receiver.id === giver.id) {
+            await interaction.reply({
+              content: "❌ You cannot give points to yourself!",
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
+
+          // Check if giver has registered
+          const giverPoints = await getUserPoints(giver.id)
+          if (giverPoints === null) {
+            await interaction.reply({
+              content: "❌ You must use `/participate` first to join the bot!",
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
+
+          // Check if receiver has registered
+          const receiverPoints = await getUserPoints(receiver.id)
+          if (receiverPoints === null) {
+            await interaction.reply({
+              content: `❌ ${receiver.username} has not joined the bot yet! They must use /participate first.`,
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
+
+          // Check if giver has enough points
+          if (giverPoints < amount) {
+            await interaction.reply({
+              content: `❌ Insufficient points! You only have **${formatNumber(giverPoints)}** points.`,
+              flags: MessageFlags.Ephemeral,
+            })
+            break
+          }
+
+          // Transfer the points
+          await updateUserPoints(giver.id, giverPoints - amount)
+          await updateUserPoints(receiver.id, receiverPoints + amount)
+
+          // Send success message
+          await interaction.reply({
+            content: `✅ You gave **${formatNumber(amount)}** points to ${receiver}!
+💰 Your new balance: **${formatNumber(giverPoints - amount)}** points`,
+            flags: MessageFlags.Ephemeral,
+          })
+
+          // Try to notify the receiver via DM
+          try {
+            await receiver.send(`💰 **Points Received!**
+
+${giver.username} has given you **${formatNumber(amount)}** points!
+
+Your new balance: **${formatNumber(receiverPoints + amount)}** points`)
+          } catch (error) {
+            // If DM fails, notify in the channel
+            await interaction.followUp({
+              content: `📢 ${receiver}, you received **${formatNumber(amount)}** points from ${giver.username}!`,
             })
           }
           break
